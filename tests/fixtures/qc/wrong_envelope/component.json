@@ -1,0 +1,13 @@
+{
+  "attributes": {
+    "category": "Test"
+  },
+  "category_code": "TEST",
+  "name": "Wrong Envelope Fixture",
+  "values": {
+    "L": {
+      "unit": "mm",
+      "value": 100
+    }
+  }
+}
