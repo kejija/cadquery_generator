@@ -82,8 +82,8 @@ def select_image(component_dir: Path, converter: Any) -> dict[str, str] | None:
     return {"path": str(path), "url": f"data:{mime};base64,{encoded}"}
 
 
-def build_context(component_id: str, converter: Any) -> tuple[dict[str, Any], dict[str, Any]]:
-    component_dir = Path("downloads") / component_id
+def build_context(component_id: str, converter: Any, downloads: Path) -> tuple[dict[str, Any], dict[str, Any]]:
+    component_dir = downloads / component_id
     component, review, evidence = converter.build_component(component_dir, None)
     specs, _ = converter.choose_specs(component_dir)
     tables = specs.get("tables") or []
@@ -205,7 +205,10 @@ def estimate_cost(model: str, usage: dict[str, Any]) -> float:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--component-id", action="append", required=True)
+    parser.add_argument("--model", action="append", choices=MODELS, help="Model to run. Repeatable. Defaults to both comparison models.")
+    parser.add_argument("--downloads", type=Path, default=Path("downloads"))
     parser.add_argument("--output", type=Path, default=Path("outputs_openai_compare_10"))
+    parser.add_argument("--flat-output", action="store_true", help="Write output/<component_id> instead of output/<model>/<component_id>. Intended for single-model runs.")
     args = parser.parse_args()
 
     api_key = load_etc_var("OPENAI_API_KEY")
@@ -215,14 +218,17 @@ def main() -> int:
     converter = load_converter()
     args.output.mkdir(parents=True, exist_ok=True)
     rows = []
-    for model in MODELS:
-        model_dir = args.output / model
+    models = tuple(args.model or MODELS)
+    if args.flat_output and len(models) != 1:
+        raise SystemExit("--flat-output requires exactly one --model")
+    for model in models:
+        model_dir = args.output if args.flat_output else args.output / model
         model_dir.mkdir(parents=True, exist_ok=True)
         for component_id in args.component_id:
             component_dir = model_dir / component_id
             component_dir.mkdir(parents=True, exist_ok=True)
-            component, context = build_context(component_id, converter)
-            image = select_image(Path("downloads") / component_id, converter)
+            component, context = build_context(component_id, converter, args.downloads)
+            image = select_image(args.downloads / component_id, converter)
             prompt = make_prompt(context)
             row = {"model": model, "component_id": component_id, "image": image["path"] if image else ""}
             try:
@@ -269,7 +275,7 @@ def main() -> int:
         writer.writerows(rows)
 
     summary = {}
-    for model in MODELS:
+    for model in models:
         model_rows = [row for row in rows if row["model"] == model]
         summary[model] = {
             "requests": len(model_rows),
@@ -282,7 +288,7 @@ def main() -> int:
             "estimated_cost_usd": round(sum(float(row.get("estimated_cost_usd") or 0) for row in model_rows), 6),
             "batch_estimated_cost_usd": round(sum(float(row.get("estimated_cost_usd") or 0) for row in model_rows) * 0.5, 6),
         }
-        summary[model]["schema_ok"] = validate_schema(args.output / model)
+        summary[model]["schema_ok"] = validate_schema(args.output if args.flat_output else args.output / model)
     (args.output / "summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     print(json.dumps(summary, indent=2, sort_keys=True))
     return 0
