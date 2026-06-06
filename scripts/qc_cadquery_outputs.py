@@ -116,6 +116,20 @@ def validate_component_schema(component: dict[str, Any], schema_path: Path) -> d
     return {"status": STATUS_PASS if not errors else STATUS_FAIL, "schema_checked": schema_checked, "errors": errors}
 
 
+def source_component_id(component: dict[str, Any], fallback: str) -> str:
+    attrs = component.get("attributes") or {}
+    for value in (attrs.get("series_code"), attrs.get("component_id"), attrs.get("misumi_id")):
+        if isinstance(value, str) and re.fullmatch(r"\d{6,}", value):
+            return value
+    source_url = attrs.get("source_url")
+    if isinstance(source_url, str):
+        match = re.search(r"/detail/(\d{6,})/", source_url)
+        if match:
+            return match.group(1)
+    matches = re.findall(r"\d{6,}", fallback)
+    return matches[-1] if matches else fallback
+
+
 def call_name(node: ast.AST) -> str:
     if isinstance(node, ast.Name):
         return node.id
@@ -533,13 +547,15 @@ def drawing_match_review(
     args: argparse.Namespace,
     component: dict[str, Any],
     component_id: str,
+    source_id: str,
     cad_metrics: dict[str, Any],
     source_metrics: dict[str, Any],
 ) -> dict[str, Any]:
-    source_images = select_source_images(args.downloads, component_id, args.max_source_images)
+    source_images = select_source_images(args.downloads, source_id, args.max_source_images)
     cad_images = render_metric_views(component_id, cad_metrics, args.output)
     base = {
         "model": args.model,
+        "source_component_id": source_id,
         "source_images": [str(path) for path in source_images],
         "cad_images": [str(path) for path in cad_images],
     }
@@ -645,7 +661,8 @@ def qc_component(args: argparse.Namespace, item: ComponentInput) -> dict[str, An
     cad_status, cad_reasons = cad_metrics_status(script_exec)
     source_metrics = extract_source_metrics(component)
     dimension_checks = compare_dimensions(source_metrics, script_exec, args.dimension_tolerance, args.dimension_policy)
-    drawing_match = drawing_match_review(args, component, item.component_id, script_exec, source_metrics)
+    source_id = source_component_id(component, item.component_id)
+    drawing_match = drawing_match_review(args, component, item.component_id, source_id, script_exec, source_metrics)
     overall_status, reasons = gate_status(
         schema_check,
         static_check,
@@ -660,6 +677,7 @@ def qc_component(args: argparse.Namespace, item: ComponentInput) -> dict[str, An
         "component_id": item.component_id,
         "component_dir": str(item.component_dir),
         "relative_key": item.relative_key,
+        "source_component_id": source_id,
         "schema_check": schema_check,
         "static_checks": static_check,
         "script_exec": {"pass": bool(script_exec.get("pass")), "error_trace": script_exec.get("error_trace", "")},
