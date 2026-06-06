@@ -543,6 +543,83 @@ def call_openai_drawing_match(
     return result
 
 
+def b64_image(path: Path) -> str:
+    return base64.b64encode(path.read_bytes()).decode("ascii")
+
+
+def call_ollama_drawing_match(
+    args: argparse.Namespace,
+    component: dict[str, Any],
+    source_images: list[Path],
+    cad_images: list[Path],
+    cad_metrics: dict[str, Any],
+    source_metrics: dict[str, Any],
+    script: str,
+) -> dict[str, Any]:
+    ordered_images = source_images + cad_images
+    prompt = (
+        "You are a strict engineering drawing to CadQuery QC reviewer. "
+        "Inspect the supplier engineering drawing images and compare them to the generated CAD evidence. "
+        "The first images are supplier drawings. The later images are CAD metric/render views. "
+        "The CAD views may be simplified, so use the CadQuery script and CAD metrics for feature evidence too. "
+        "Return JSON only with keys geometry_match, verdict, mismatches, missing_features, extra_features, "
+        "orientation_mismatch, dimension_label_mismatches, confidence, rationale. "
+        "verdict must be pass, review, or fail. Focus on representative geometry: shaft vs block, flange presence, "
+        "hole/bore patterns, assembly vs single solid, missing major features. Do not fail configurable L/D ratios alone. "
+        "confidence must be a number from 0.0 to 1.0.\n"
+        "Context JSON:\n"
+        + json.dumps(
+            {
+                "name": component.get("name"),
+                "category": (component.get("attributes") or {}).get("category"),
+                "drawing_geometry_types": source_metrics.get("geometry_types"),
+                "configurable_family": source_metrics.get("configurable_family"),
+                "cad_metrics": cad_metrics,
+                "source_image_names": [path.name for path in source_images],
+                "cad_image_names": [path.name for path in cad_images],
+                "cadquery_script_excerpt": script[:12000],
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )[:24000]
+    )
+    payload = {
+        "model": args.model,
+        "messages": [{"role": "user", "content": prompt, "images": [b64_image(path) for path in ordered_images]}],
+        "stream": False,
+        "format": "json",
+        "options": {"temperature": 0, "top_p": 0.2, "num_ctx": args.ollama_num_ctx},
+    }
+    request = urllib.request.Request(
+        args.ollama_host.rstrip("/") + "/api/chat",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(request, timeout=args.ollama_timeout) as response:
+        raw = json.loads(response.read().decode("utf-8"))
+    content = ((raw.get("message") or {}).get("content") or "").strip()
+    result = parse_json_object(content)
+    result["confidence"] = normalize_confidence(result.get("confidence"))
+    result["model"] = args.model
+    result["provider"] = "ollama"
+    result["source_images"] = [str(path) for path in source_images]
+    result["cad_images"] = [str(path) for path in cad_images]
+    result["raw_eval"] = {key: raw.get(key) for key in ("total_duration", "load_duration", "prompt_eval_count", "eval_count")}
+    return result
+
+
+def normalize_confidence(raw: Any) -> float:
+    try:
+        confidence = float(raw)
+    except (TypeError, ValueError):
+        return 0.0
+    if confidence > 1.0 and confidence <= 10.0:
+        confidence = confidence / 10.0
+    if confidence > 1.0 and confidence <= 100.0:
+        confidence = confidence / 100.0
+    return round(max(0.0, min(1.0, confidence)), 3)
+
+
 def drawing_match_review(
     args: argparse.Namespace,
     component: dict[str, Any],
@@ -550,6 +627,7 @@ def drawing_match_review(
     source_id: str,
     cad_metrics: dict[str, Any],
     source_metrics: dict[str, Any],
+    script: str,
 ) -> dict[str, Any]:
     source_images = select_source_images(args.downloads, source_id, args.max_source_images)
     cad_images = render_metric_views(component_id, cad_metrics, args.output)
@@ -565,6 +643,15 @@ def drawing_match_review(
         return {**base, "status": "skipped", "verdict": STATUS_REVIEW, "confidence": 0.0, "reason": "no source drawing images found"}
     if not cad_images:
         return {**base, "status": "skipped", "verdict": STATUS_REVIEW, "confidence": 0.0, "reason": "CAD render generation unavailable"}
+    if args.vision_provider == "ollama":
+        try:
+            result = call_ollama_drawing_match(args, component, source_images, cad_images, cad_metrics, source_metrics, script)
+            result["status"] = "error" if result.get("error") else "complete"
+            result.setdefault("verdict", STATUS_REVIEW)
+            result.setdefault("confidence", 0.0)
+            return result
+        except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, json.JSONDecodeError, KeyError, OSError) as exc:
+            return {**base, "status": "error", "verdict": STATUS_REVIEW, "confidence": 0.0, "reason": repr(exc), "provider": "ollama"}
     api_key = load_etc_var("OPENAI_API_KEY")
     if not api_key:
         return {**base, "status": "skipped", "verdict": STATUS_REVIEW, "confidence": 0.0, "reason": "OPENAI_API_KEY not found"}
@@ -662,7 +749,7 @@ def qc_component(args: argparse.Namespace, item: ComponentInput) -> dict[str, An
     source_metrics = extract_source_metrics(component)
     dimension_checks = compare_dimensions(source_metrics, script_exec, args.dimension_tolerance, args.dimension_policy)
     source_id = source_component_id(component, item.component_id)
-    drawing_match = drawing_match_review(args, component, item.component_id, source_id, script_exec, source_metrics)
+    drawing_match = drawing_match_review(args, component, item.component_id, source_id, script_exec, source_metrics, script)
     overall_status, reasons = gate_status(
         schema_check,
         static_check,
@@ -751,6 +838,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--outputs", type=Path, required=True, help="Directory containing generated component.json/cadquery_script.py outputs.")
     parser.add_argument("--downloads", type=Path, default=Path("downloads"), help="Directory containing source drawings/spec tables.")
     parser.add_argument("--model", default="gpt-5.4-mini", help="Vision model for drawing-match review.")
+    parser.add_argument("--vision-provider", choices=("openai", "ollama"), default="openai")
+    parser.add_argument("--ollama-host", default="http://127.0.0.1:11434")
+    parser.add_argument("--ollama-timeout", type=int, default=240)
+    parser.add_argument("--ollama-num-ctx", type=int, default=32768)
     parser.add_argument("--output", type=Path, required=True, help="QC output directory.")
     parser.add_argument("--schema", type=Path, default=Path("component_schema.json"))
     parser.add_argument("--python-bin", type=Path, default=Path(".venv/bin/python"))
