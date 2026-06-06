@@ -52,4 +52,6 @@ For deterministic-only checks without OpenAI vision review:
 python scripts/qc_cadquery_outputs.py --outputs outputs_openai_compare_10/gpt-5.4-mini --downloads downloads --output qc_openai_mini --skip-vision
 ```
 
+By default, dimension checks use `--dimension-policy representative`. This treats MISUMI variant/configurable family dimensions as informational because the supplier drawing is usually a representative shape, not a selected-SKU declaration. Use `--dimension-policy strict` only when the output is supposed to match one concrete configured part number and bbox dimensions should gate quality.
+
 The QC command writes one `qc.json` per component plus `qc_summary.csv` and `qc_summary.json`. Each scorecard includes schema/static checks, CadQuery execution metrics, source dimension checks, drawing-match status, `overall_status`, and a compact `repair_prompt`.

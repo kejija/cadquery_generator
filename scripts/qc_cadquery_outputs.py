@@ -32,6 +32,7 @@ except ModuleNotFoundError:  # pragma: no cover - handled at runtime.
 STATUS_PASS = "pass"
 STATUS_REVIEW = "review"
 STATUS_FAIL = "fail"
+STATUS_INFO = "info"
 
 PLACEHOLDER_RE = re.compile(r"\b(todo|placeholder|assum(?:e|ed|ption)|verify|replace with|unknown|tbd)\b", re.I)
 RANGE_RE = re.compile(r"^\s*(-?\d+(?:\.\d+)?)\s*(?:~|-|to)\s*(-?\d+(?:\.\d+)?)\s*$", re.I)
@@ -280,8 +281,22 @@ def parse_numeric_value(raw: Any) -> dict[str, Any] | None:
     return None
 
 
+def is_configurable_family(component: dict[str, Any]) -> bool:
+    if component.get("configuration_schema"):
+        return True
+    attrs = component.get("attributes") or {}
+    if attrs.get("configuration_count"):
+        return True
+    values = component.get("values") or {}
+    for entry in values.values():
+        value = entry.get("value") if isinstance(entry, dict) else entry
+        if isinstance(value, str) and (RANGE_RE.match(value.strip()) or "select_by" in value.lower()):
+            return True
+    return False
+
+
 def extract_source_metrics(component: dict[str, Any]) -> dict[str, Any]:
-    metrics = {"values": {}, "placeholders": [], "geometry_types": [], "review_flags": []}
+    metrics = {"values": {}, "placeholders": [], "geometry_types": [], "review_flags": [], "configurable_family": is_configurable_family(component)}
     for key, entry in (component.get("values") or {}).items():
         value = entry.get("value") if isinstance(entry, dict) else entry
         parsed = parse_numeric_value(value)
@@ -322,7 +337,12 @@ def expected_matches_observed(expected: dict[str, Any], observed: float, toleran
     return abs(float(expected["value"]) - observed) <= max(0.5, abs(float(expected["value"])) * tolerance_ratio)
 
 
-def compare_dimensions(source_metrics: dict[str, Any], cad_metrics: dict[str, Any], tolerance_ratio: float) -> list[dict[str, Any]]:
+def compare_dimensions(
+    source_metrics: dict[str, Any],
+    cad_metrics: dict[str, Any],
+    tolerance_ratio: float,
+    dimension_policy: str,
+) -> list[dict[str, Any]]:
     bbox = cad_metrics.get("bbox") or {}
     axes = {
         "x": float(bbox.get("xlen") or 0),
@@ -348,7 +368,10 @@ def compare_dimensions(source_metrics: dict[str, Any], cad_metrics: dict[str, An
             for axis, value in observed_candidates.items()
             if value > 0 and expected_matches_observed(expected, value, tolerance_ratio)
         ]
-        status = STATUS_PASS if matches else STATUS_REVIEW
+        gate_impact = dimension_policy == "strict"
+        if dimension_policy == "representative" and source_metrics.get("configurable_family"):
+            gate_impact = False
+        status = STATUS_PASS if matches else (STATUS_REVIEW if gate_impact else STATUS_INFO)
         checks.append(
             {
                 "key": key,
@@ -356,6 +379,7 @@ def compare_dimensions(source_metrics: dict[str, Any], cad_metrics: dict[str, An
                 "expected": expected,
                 "observed_candidates": observed_candidates,
                 "status": status,
+                "gate_impact": gate_impact,
                 "evidence": "bbox axis match" if matches else "no bbox axis matched expected source value/range",
                 "matches": matches,
             }
@@ -562,15 +586,16 @@ def gate_status(
         fail_reasons.extend(cad_reasons)
     if drawing_match.get("verdict") == STATUS_FAIL:
         fail_reasons.append("vision drawing-match verdict failed")
+    strict_dimension_checks = [check for check in dimension_checks if check.get("gate_impact")]
     if source_metrics.get("placeholders"):
         review_reasons.append("source values contain placeholders")
-    if source_metrics.get("review_flags"):
+    if source_metrics.get("review_flags") and not source_metrics.get("configurable_family"):
         review_reasons.append("component source status requires review")
     if static_check.get("warnings"):
         review_reasons.extend(static_check["warnings"])
     if not dimension_checks:
         review_reasons.append("no source-backed numeric dimensions could be checked")
-    elif any(check["status"] != STATUS_PASS for check in dimension_checks):
+    elif strict_dimension_checks and any(check["status"] != STATUS_PASS for check in strict_dimension_checks):
         review_reasons.append("one or more source dimensions did not match CAD bbox checks")
     if drawing_match.get("status") != "complete":
         review_reasons.append(f"drawing-match vision review {drawing_match.get('status', 'unknown')}")
@@ -590,7 +615,7 @@ def repair_prompt(component: dict[str, Any], qc: dict[str, Any]) -> str:
     dim_failures = [
         f"{check['key']} expected {check['expected']} but observed bbox candidates {check['observed_candidates']}"
         for check in qc.get("dimension_checks") or []
-        if check.get("status") != STATUS_PASS
+        if check.get("gate_impact") and check.get("status") != STATUS_PASS
     ][:8]
     drawing = qc.get("drawing_match") or {}
     vision_bits = []
@@ -600,7 +625,7 @@ def repair_prompt(component: dict[str, Any], qc: dict[str, Any]) -> str:
             vision_bits.append(f"{key}: {value}")
     return (
         "Regenerate/fix the CadQuery 2.x script for this component. "
-        "Define result as cq.Workplane or cq.Assembly, avoid show_object/cq.math/named colors, and use only source-backed dimensions. "
+        "Define result as cq.Workplane or cq.Assembly, avoid show_object/cq.math/named colors, and match the representative drawing geometry. "
         f"Component: {component.get('name')}. "
         f"QC status: {qc.get('overall_status')}. Reasons: {'; '.join(map(str, failures[:10]))}. "
         f"Dimension issues: {'; '.join(dim_failures) if dim_failures else 'none reported'}. "
@@ -619,7 +644,7 @@ def qc_component(args: argparse.Namespace, item: ComponentInput) -> dict[str, An
         script_exec = run_cadquery(item.script_path, args.python_bin, args.timeout)
     cad_status, cad_reasons = cad_metrics_status(script_exec)
     source_metrics = extract_source_metrics(component)
-    dimension_checks = compare_dimensions(source_metrics, script_exec, args.dimension_tolerance)
+    dimension_checks = compare_dimensions(source_metrics, script_exec, args.dimension_tolerance, args.dimension_policy)
     drawing_match = drawing_match_review(args, component, item.component_id, script_exec, source_metrics)
     overall_status, reasons = gate_status(
         schema_check,
@@ -640,6 +665,7 @@ def qc_component(args: argparse.Namespace, item: ComponentInput) -> dict[str, An
         "script_exec": {"pass": bool(script_exec.get("pass")), "error_trace": script_exec.get("error_trace", "")},
         "cad_metrics": {key: value for key, value in script_exec.items() if key not in {"pass", "error_trace"}},
         "source_metrics": source_metrics,
+        "dimension_policy": args.dimension_policy,
         "dimension_checks": dimension_checks,
         "drawing_match": drawing_match,
         "overall_status": overall_status,
@@ -669,6 +695,7 @@ def write_summary(output_dir: Path, rows: list[dict[str, Any]]) -> None:
         "assembly_children",
         "dimension_pass",
         "dimension_review",
+        "dimension_info",
         "drawing_verdict",
         "drawing_confidence",
         "reason_count",
@@ -692,7 +719,8 @@ def write_summary(output_dir: Path, rows: list[dict[str, Any]]) -> None:
                     "solids_count": cad.get("solids_count", ""),
                     "assembly_children": cad.get("assembly_children", ""),
                     "dimension_pass": sum(1 for check in dim_checks if check.get("status") == STATUS_PASS),
-                    "dimension_review": sum(1 for check in dim_checks if check.get("status") != STATUS_PASS),
+                    "dimension_review": sum(1 for check in dim_checks if check.get("status") == STATUS_REVIEW),
+                    "dimension_info": sum(1 for check in dim_checks if check.get("status") == STATUS_INFO),
                     "drawing_verdict": drawing.get("verdict", ""),
                     "drawing_confidence": drawing.get("confidence", ""),
                     "reason_count": len(row.get("reasons") or []),
@@ -710,6 +738,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--python-bin", type=Path, default=Path(".venv/bin/python"))
     parser.add_argument("--timeout", type=int, default=45)
     parser.add_argument("--dimension-tolerance", type=float, default=0.05)
+    parser.add_argument(
+        "--dimension-policy",
+        choices=("representative", "strict"),
+        default="representative",
+        help="In representative mode, configurable-family dimensions are informational; strict mode gates on bbox dimension mismatches.",
+    )
     parser.add_argument("--max-source-images", type=int, default=3)
     parser.add_argument("--skip-vision", action="store_true", help="Skip OpenAI drawing-match review and only run deterministic QC.")
     parser.add_argument("--no-high-detail-retry", action="store_true", help="Disable high-detail retry for borderline vision confidence.")
