@@ -52,6 +52,28 @@ def test_unmapped_category_uses_first_token():
     assert _normalize_category("widget_gizmo") == "widget"
 
 
+def test_part_family_fallback_when_category_code_empty():
+    # category_code is empty (typical real-data case) but part_family is set.
+    assert _normalize_category("", "Linear Shaft - One End Stepped") == "shaft"
+    assert _normalize_category("", "Linear shaft one end stepped") == "shaft"
+    assert _normalize_category("", "Air Couplers - Socket, Nut Tightening") == "coupler"
+    assert _normalize_category("", "Hinge Bases - U-Shaped, Inch") == "hinge"
+    assert _normalize_category("", "Plate Brackets - 8 Series") == "plate"  # 'plate' prefix wins over 'bracket'
+    assert _normalize_category("", "40x120 Aluminum Extrusion - 8 Series") == "extrusion"
+    assert _normalize_category("", "Brackets - 8-45 Series, Reversal Brackets with Single Side Tab") == "bracket"
+
+
+def test_part_family_fallback_returns_unknown_for_unrecognized():
+    # A part_family that no prefix matches still falls through to 'unknown'.
+    assert _normalize_category("", "Mystery Gizmo 9000") == "unknown"
+
+
+def test_explicit_category_code_wins_over_part_family_fallback():
+    # If a category_code is present, the part_family fallback is NOT used.
+    # This is the override rule: explicit metadata beats text inference.
+    assert _normalize_category("ball_bearing", "Hinge Bases - U-Shaped") == "bearing"
+
+
 def test_synonyms_dict_covers_documented_cases():
     # Sanity: if a synonym is dropped from CATEGORY_SYNONYMS, fail loudly.
     assert "ball_bearing" in CATEGORY_SYNONYMS
@@ -72,8 +94,11 @@ def test_build_fingerprint_from_real_component():
     fp = build_fingerprint(REAL_TEMPLATE, "110300324920")
     assert isinstance(fp, ComponentFingerprint)
     assert fp.component_id == "110300324920"
-    # No category_code in the template, so category_root must be 'unknown'.
-    assert fp.category_root == "unknown"
+    # No explicit category_code in the template, but part_family is
+    # "Air Couplers - Socket, Nut Tightening" — that triggers the
+    # PART_FAMILY_PREFIX_CATEGORIES fallback to "coupler".
+    assert fp.category_root == "coupler"
+    assert fp.category_code == ""  # still empty — only the root was inferred
     assert fp.template_signature is not None
     assert "simplified_single_body" in fp.template_signature
     assert fp.text_for_embedding != ""
