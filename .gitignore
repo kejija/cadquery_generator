@@ -8,7 +8,10 @@ outputs/
 outputs_*/
 output/
 qc_*/
+
+# Local scrape data (27MB+), regenerable.
+downloads/
+
+# Auto-discovered by some Codex versions
 .venv-sim/
 .chroma/
-__pycache__/
-*.pyc
