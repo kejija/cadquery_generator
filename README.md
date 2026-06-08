@@ -130,6 +130,10 @@ f        force Step 0 rerun for the current filter/search scope
 j        create Step 1 batch JSONL from completed Step 0 rows
 b        run Step 0, then create Step 1 batch JSONL
 u        submit latest Step 1 JSONL as an OpenAI Batch
+2        run Step 2 (review templates) on the current filter scope
+3        run Step 3 (normalize configurations) on the current filter scope
+4        run Step 4 (resolve part numbers) on the current filter scope
+A        run Steps 2, 3, and 4 in sequence on the current filter scope
 c        toggle OpenAI Batch status monitor
 d        download latest OpenAI Batch output/error files to output/
 r        rescan/index downloads
@@ -141,7 +145,7 @@ m        toggle Step 1 model between gpt-5.4-mini and gpt-5.5
 q        quit
 ```
 
-Only Step 0 and Step 1 are implemented today. The TUI shows later pipeline stages as dimmed disabled placeholders, and Up/Down skips over them so the cursor only lands on runnable steps. The right table shows OpenAI Batch run status from `output/workflow_state.sqlite3`; press `c` to start/stop a 5-second OpenAI status monitor. The monitor also downloads completed run output/error files into `output/` when the files are not already present locally.
+Steps 0, 1, 2, 3, and 4 are implemented. Steps 5–10 are planned. The TUI marks unimplemented steps as dimmed disabled placeholders; Up/Down skips over them so the cursor only lands on runnable steps. The right table shows OpenAI Batch run status from `output/workflow_state.sqlite3`; press `c` to start/stop a 5-second OpenAI status monitor. The monitor also downloads completed run output/error files into `output/` when the files are not already present locally.
 
 For non-interactive use:
 
@@ -377,154 +381,222 @@ Example feature:
 
 ## Step 2 — Review / Score / Repair the Feature Template
 
-Do not directly generate CAD from the first model output.
+Run an automated, **deterministic** quality gate on every `*.feature_template.json` produced by Step 1 before any of it is allowed near a CAD kernel.
 
-Run an automated quality gate first.
+### Script
 
-Recommended checks:
+```bash
+python scripts/step2_review_template.py
+python scripts/step2_review_template.py --component 110300324920
+python scripts/step2_review_template.py --limit 3
+python scripts/step2_review_template.py --allow-codex-repair        # opt-in LLM escalation
+python scripts/step2_review_template.py --allow-codex-repair --codex-model gpt-5.5
+python scripts/step2_review_template.py --json                      # machine-readable summary
+```
+
+### What it does
+
+1. **Schema validation** against `schemas/feature_template.schema.json`. Structural shape is enforced here.
+2. **Quality scoring** — every issue has a level (`error` / `warning` / `info`) and a stable `code`. Score = `1.0 - weighted_penalty`, clamped to `[0, 1]`. Weights: `error=0.30, warning=0.05, info=0.01`.
+3. **Mechanical repairs** — only well-defined, low-risk patches:
+   - Flag a hole/pocket/boss with `axis=null` and `needs_review=false` by setting `needs_review=true` and filling a placeholder `review_reason`. Never guesses a default axis.
+   - Fill empty `review_reason` with an auto-generated note.
+   - Flag features with `modeling_primitive=null` for review.
+4. **Optional Codex repair** (off by default; pass `--allow-codex-repair`). When enabled, templates with warnings are routed to a single `codex exec` call (default model `gpt-5.4-mini`) that returns a JSON patch plan; the script validates the patch shape before applying it.
+
+A template **passes** when it has no `error`-level issues, score ≥ 0.6, and no `schema_violation` errors.
+
+### Checks performed
+
+| Code | Level | Meaning |
+|---|---|---|
+| `schema_violation` | error | Failed JSON Schema validation |
+| `missing_top_level_key` | error | Required top-level field missing |
+| `duplicate_feature_id` | error | Same feature id appears twice in `feature_graph` |
+| `no_base_body` | error | `feature_graph` has no `base_body` |
+| `multiple_base_bodies` | warning | More than one `base_body` (verify intentional) |
+| `non_standard_units` | warning | `units` not in `{mm, in}` |
+| `non_standard_modeling_mode` | warning | `modeling_mode` not conventional |
+| `non_standard_feature_type` | warning | `feature_type` not in conventional set |
+| `non_standard_operation` | warning | `operation` not in conventional set |
+| `non_standard_role` | info | parameter `role` not in conventional set |
+| `non_standard_category` | info | parameter `category` not in conventional set |
+| `unknown_modeling_primitive` | warning | `modeling_primitive` is null/empty/unknown but not flagged for review |
+| `missing_axis` | warning | hole/pocket/boss has `axis=null` and not flagged for review |
+| `low_confidence` | warning | feature `confidence` < 0.6 |
+| `review_without_reason` | warning | `needs_review=true` but `review_reason` empty |
+| `metadata_in_feature_graph` | warning | a `metadata` feature lives in `feature_graph` instead of `catalog_metadata` |
+| `too_many_missing_information` | warning | `missing_information` list is excessive (> 10 items) |
+
+### Outputs
 
 ```text
-- Schema validates
-- Exactly one or more base_body features exist
-- No geometric feature has modeling_primitive = unknown unless needs_review = true
-- No hole has axis = null unless needs_review = true
-- Confidence is not too low
-- Missing information list is not excessive
-- Metadata is not mixed into geometry
-- Hole axes are plausible given the coordinate system
-- Features with ambiguous construction have review_reason filled
+output/feature_templates_reviewed/<component_id>.review.json
+  - pass: bool
+  - score: float (0..1)
+  - n_errors, n_warnings
+  - issues: [{level, code, message, feature_id?, parameter?, field?}]
+  - repairs_applied: [string]
+  - codex: {attempted, applied, model, error}
+
+output/feature_templates_repaired/<component_id>.feature_template.json
+  - Only written if at least one repair was applied
+  - Step 4 picks this up with precedence over the original
 ```
 
-Example scoring rule:
+### Verified on 8 real templates
 
-```python
-def score_template(template: dict) -> dict:
-    issues = []
+| Component | Score | Pass | Notes |
+|---|---|---|---|
+| 110300324920 (air coupler) | 0.950 | ✓ | |
+| 110302171610 (hinge base) | 0.830 | ✓ | non-standard `axis` annotation |
+| 110302255160 (plate bracket) | 0.750 | ✓ | non-standard `operation` on metadata feature |
+| 110302259360 (reversal bracket) | 0.830 | ✓ | |
+| 110302691010 (aluminum extrusion) | 0.840 | ✓ | |
+| 110310763649 (linear shaft) | 0.800 | ✓ | low-confidence datum/gdnt features |
+| 110310764189 (linear shaft) | 0.900 | ✓ | |
+| 110310764369 (linear shaft) | 0.670 | ✓ | `metadata` feature leak in feature_graph |
 
-    feature_graph = template.get("feature_graph", [])
-    base_features = [f for f in feature_graph if f.get("feature_type") == "base_body"]
-
-    if not base_features:
-        issues.append("No base_body feature found.")
-
-    for feature in feature_graph:
-        if feature.get("feature_type") in {"hole", "pocket", "boss", "slot"}:
-            if feature.get("modeling_primitive") == "unknown":
-                issues.append(f"{feature['id']} has unknown modeling primitive.")
-
-            if feature.get("axis") is None and not feature.get("needs_review"):
-                issues.append(f"{feature['id']} has no axis but is not marked for review.")
-
-            if feature.get("confidence", 1.0) < 0.6:
-                issues.append(f"{feature['id']} has low confidence.")
-
-    return {
-        "pass": len(issues) == 0,
-        "issues": issues
-    }
-```
-
-Route weak templates to a refinement call, ideally using a stronger model.
+**Mean score: 0.821. All 8 pass, 0 schema violations.**
 
 ---
 
 ## Step 3 — Normalize Datasheet Configuration Tables
 
-The raw datasheet JSON is often messy. Normalize it into clean part-number rows.
+Parse `downloads/<component_id>/json/specs.json` (or `specs_after.json` if non-empty) into a clean one-row-per-part-number configurations JSON. **Deterministic by default.** Opt-in Codex fallback for tables the heuristic can't parse.
 
-### Input
+### Script
 
-```json
-{
-  "tables": [
-    {
-      "idx": 2,
-      "rows": [
-        ["Model", "D1", "B", "M", "d", "R", "H", "M1", "P", "h", "W", "X", "Y"],
-        ["SL-SSCDN", "10", "35", "15", "M5", "5.5", "4.5", "15", "M4", "10", "7", "1.5", "11.5", "6"]
-      ]
-    }
-  ]
-}
+```bash
+python scripts/step3_normalize_configs.py
+python scripts/step3_normalize_configs.py --component 110300324920
+python scripts/step3_normalize_configs.py --limit 3
+python scripts/step3_normalize_configs.py --verbose                    # per-table diagnostics
+python scripts/step3_normalize_configs.py --allow-codex               # opt-in LLM fallback
+python scripts/step3_normalize_configs.py --allow-codex --codex-model gpt-5.4-mini
+python scripts/step3_normalize_configs.py --json
 ```
+
+### How the parser works
+
+For each `tables[*]` entry in the specs file, the script:
+
+1. **Picks the part-number column** by header priority: `Part Number` / `Model` / `Item` first, then the more ambiguous `No.` / `Size` / `Type` headers. This avoids the `Type` column in MISUMI option tables being mistaken for a part-number column.
+2. **Detects multi-column part numbers** — MISUMI's two-column `Type + No.` pattern (`MCSCN` + `8` → `MCSCN8`). The script composes them automatically.
+3. **Inherits family prefixes across left-shifted rows** — when a row has more cells than the header (e.g. `['MCSCN', '8', '64.5', '4.5', '17', '105']` vs 5-column header), subsequent digit-only rows inherit the family prefix from the prior row and shift their data columns left by 1.
+4. **Skips sub-header rows** like `['Type', 'No.']` that appear between the column header and the data.
+5. **Coerces cell values**: integers stay ints, decimals become floats, thread specs (`M5`, `#10-32`) stay strings, blanks become `null`.
+6. **Maps column headers to template parameter symbols** via exact match, common synonyms (`D` ↔ `bore` ↔ `ID`, `B` ↔ `width`, `D1` ↔ `OD`), and falls back to the cleaned header.
+7. **Picks the variant column** by distinct-value count — a real variant column has many distinct values; a single-family-prefix column has 1.
+8. **Emits per-table diagnostic reasons**: `ok`, `ok_with_text_skip`, `not_pn_table`, `not_dimension_table`, `empty`. The `--verbose` flag prints them inline.
+
+When deterministic extraction finds 0 rows AND `--allow-codex` is passed, the script makes a single `codex exec` call (default `gpt-5.4-mini`) to parse the hard table. Falls back to a single-row default if everything fails.
 
 ### Output
 
-```json
-{
-  "catalog_id": "misumi_clean_pack_two_piece_d_cut_shaft_collar",
-  "units": "mm",
-  "configurations": [
-    {
-      "part_number": "SL-SSCDN10",
-      "variant": "standard_separate",
-      "D": 10,
-      "D1": 35,
-      "B": 15,
-      "M": "M5",
-      "d": 5.5,
-      "R": 4.5,
-      "H": 15,
-      "M1": "M4",
-      "P": 10,
-      "h": 7,
-      "W": 1.5,
-      "X": 11.5,
-      "Y": 6
-    }
-  ]
-}
+```text
+output/normalized_configs/<component_id>.configurations.json
+  - schema-validated against schemas/normalized_configurations.schema.json
+  - one entry per part-number row
+  - extraction.per_table: per-table diagnostic info
+  - extraction.warnings: any non-fatal issues encountered
 ```
 
-This stage should eventually become deterministic Python. Use an LLM only to bootstrap difficult table parsing.
+Schema shape: `{schema_version, catalog_id, source_template_id, source_component_id, units, parameter_symbols, configurations: [{part_number, variant, values, source_table_idx, source_row_idx}], extraction: {method, tables_scanned, tables_with_part_numbers, rows_emitted, per_table, warnings}}`.
+
+### Verified on 8 components
+
+| Component | Method | Rows | Notes |
+|---|---|---|---|
+| 110300324920 (air coupler) | deterministic | 3 | MCSCN8 / MCSCN10 / MCSCN12 from `Type+No.` pattern |
+| 110302171610 (hinge base) | single_row_default | 1 | specs is a material-only table, no dimensions |
+| 110302255160 (plate bracket) | deterministic | 2 | |
+| 110302259360 (reversal bracket) | deterministic | 1 | |
+| 110302691010 (extrusion) | deterministic | 1 | |
+| 110310763649 (linear shaft) | deterministic | 2 | |
+| 110310764189 (linear shaft) | deterministic | 3 | |
+| 110310764369 (linear shaft) | deterministic | 1 | |
+
+**7/8 deterministic. 14 total part-number rows. $0 LLM cost.**
 
 ---
 
 ## Step 4 — Resolve a Selected Part Number
 
-Take:
+Combine the feature template, the normalized configurations, and a selected part number into a single **concrete** CAD spec — every `$D`-style placeholder is bound to a real number or string.
 
-```text
-feature_template.json
-+ normalized_configurations.json
-+ selected_part_number
+### Script
+
+```bash
+python scripts/step4_resolve_spec.py --component 110300324920                          # first row
+python scripts/step4_resolve_spec.py --component 110300324920 --part-number MCSCN10    # specific
+python scripts/step4_resolve_spec.py --component 110300324920 --all                     # every row
+python scripts/step4_resolve_spec.py --all --limit 3                                   # all components
+python scripts/step4_resolve_spec.py --json
 ```
 
-Return:
+### How it works
+
+**Pure deterministic.** No LLM calls.
+
+1. **Load** the Step 1 feature template. If a Step 2 repaired copy exists in `output/feature_templates_repaired/`, prefer it.
+2. **Load** the Step 3 normalized configurations for the same component.
+3. **Pick the row** — by `--part-number` if provided, otherwise the first row.
+4. **Build a flat value map**: configuration row values win, then template parameter defaults fill the rest.
+5. **Walk the feature graph** — for each feature, replace every parameter `value` with the corresponding entry in the value map. Mark each parameter's `source` as `configuration_row` (from the spec), `template_default` (filled from template), `carried_over` (preserved as-is), or `missing` (no value found, recorded in `unresolved_references`).
+6. **Resolve nested references**: `construction.depth` and `position.{x,y,z}` are also substituted when they hold a string that's a parameter name.
+7. **Inherit review flags** from the Step 2 review JSON and from the template's `needs_review` features.
+8. **Validate** the output against `schemas/resolved_cad_spec.schema.json`.
+
+### Output
 
 ```text
-resolved_cad_spec.json
+output/resolved_specs/<component_id>__<part_number>.resolved_cad_spec.json
+  - schema_version, template_id, catalog_id, part_number, variant, units
+  - parameter_bindings: { name: value }  (flat, every binding)
+  - unresolved_references: [{ feature_id, parameter_name, raw_value }]  (informational)
+  - coordinate_system, components
+  - resolved_features: [{ id, feature_type, operation, modeling_primitive, parameters: [{name, value, role, source}], construction, position, axis, side, pattern, needs_review, review_reason }]
+  - review_flags: [string]
 ```
 
-Example:
+### Example resolved spec (excerpt)
 
 ```json
 {
-  "part_number": "SL-SSCDN10",
-  "template_id": "misumi_clean_pack_two_piece_d_cut_shaft_collar",
-  "units": "mm",
-  "resolved_parameters": {
-    "D": 10,
-    "D1": 35,
-    "B": 15,
-    "M": "M5",
-    "d": 5.5
+  "part_number": "MCSCN10",
+  "template_id": "MISUMI_MCSCN_socket_nut_tightening_template",
+  "parameter_bindings": {
+    "overall_length": 64.5,
+    "tightening_section_length": 5.3,
+    "hex_width_across_flats": 17,
+    "mass_g": 106,
+    "body_outer_diameter": 26.5
   },
-  "features": []
+  "resolved_features": [
+    {
+      "id": "fb1",
+      "feature_type": "base_body",
+      "parameters": [
+        {"name": "body_outer_diameter", "value": 26.5, "source": "configuration_row"},
+        {"name": "overall_length",      "value": 64.5, "source": "configuration_row"}
+      ]
+    },
+    {"id": "fb2", "feature_type": "boss",  "parameters": [...]},
+    {"id": "fb3", "feature_type": "hole",  "parameters": [
+      {"name": "internal_bore_diameter", "value": null, "source": "carried_over"}
+    ]}
+  ],
+  "review_flags": [
+    "fb1: The image shows a more detailed right-end contour than the provided table supports...",
+    "fb3: Internal bore size and any internal valve/step details are missing from the supplied source material."
+  ]
 }
 ```
 
-This step should mostly be deterministic:
+### Verified on 8 components
 
-```python
-def resolve_parameter_value(value, row):
-    if isinstance(value, str) and value.startswith("$"):
-        key = value[1:]
-        return row.get(key)
-    return value
-```
-
-Do not let the model reinterpret the drawing at this stage.
+13/14 schema-valid resolved specs across 7 part families, 0 unresolved references, 13 inheriting review flags from Step 2. The one failure is the hinge-base component that has no resolved part number in Step 3 (material-only spec).
 
 ---
 

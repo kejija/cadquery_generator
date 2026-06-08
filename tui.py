@@ -7,6 +7,7 @@ import argparse
 import asyncio
 import json
 import os
+import subprocess
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -36,6 +37,7 @@ from scripts.workflow_state import (
 STATUS_FILTERS = ["all", "pending", "done", "error", "skipped"]
 STEP1_MODEL_CHOICES = ("gpt-5.4-mini", "gpt-5.5")
 BATCH_TERMINAL_STATUSES = {"completed", "failed", "cancelled", "expired"}
+REPO_ROOT = Path(__file__).resolve().parent
 
 
 @dataclass
@@ -66,9 +68,9 @@ class WorkflowState:
             WorkflowStep("step0", "0 Main drawing", "ready", True, True),
             WorkflowStep("step1_jsonl", "1 Create JSONL", "ready", True, True),
             WorkflowStep("step1_submit", "1b Batch submit/output", "ready", True, False),
-            WorkflowStep("step2_parse", "2 Parse templates", "placeholder", False, False),
-            WorkflowStep("step3_cad", "3 Generate CAD", "placeholder", False, False),
-            WorkflowStep("step4_qc", "4 Render/QC", "placeholder", False, False),
+            WorkflowStep("step2_review", "2 Review templates", "ready", True, False),
+            WorkflowStep("step3_normalize", "3 Normalize configs", "ready", True, False),
+            WorkflowStep("step4_resolve", "4 Resolve part numbers", "ready", True, False),
             WorkflowStep("step5_export", "5 Export artifacts", "placeholder", False, False),
         ]
     )
@@ -128,6 +130,122 @@ def run_step1_jsonl_for_state(state: WorkflowState) -> Path:
     state.step1_jsonl_path = output_path
     state.message = f"Created {output_path}"
     return output_path
+
+
+def _run_step_subprocess(state: WorkflowState, cmd: list[str], *, timeout_s: int = 1800) -> dict:
+    """Run a step as a subprocess from the repo root. Returns {ok, returncode, stdout, stderr}."""
+    try:
+        proc = subprocess.run(
+            cmd,
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=timeout_s,
+            check=False,
+        )
+        return {
+            "ok": proc.returncode == 0,
+            "returncode": proc.returncode,
+            "stdout": proc.stdout,
+            "stderr": proc.stderr,
+        }
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "returncode": -1, "stdout": "", "stderr": f"timeout after {timeout_s}s"}
+    except FileNotFoundError as exc:
+        return {"ok": False, "returncode": -1, "stdout": "", "stderr": str(exc)}
+
+
+def run_step2_for_state(state: WorkflowState) -> dict:
+    """Run Step 2 (review templates) on the current filter scope via subprocess.
+
+    Uses --json output and parses the summary. On success, sets state.message
+    to a short human-readable summary. On failure, populates state.errors.
+    """
+    result = _run_step_subprocess(
+        state,
+        ["python", "scripts/step2_review_template.py", "--json"],
+    )
+    if result["ok"]:
+        state.errors = []
+        try:
+            payload = json.loads(result["stdout"])
+            state.message = (
+                f"Step 2: passed={payload.get('n_passed', 0)}/{payload.get('n', 0)} "
+                f"mean_score={payload.get('mean_score', 0):.3f}"
+            )
+        except json.JSONDecodeError:
+            state.message = "Step 2: completed (unparseable --json output)"
+    else:
+        state.errors = [result["stderr"][-500:]]
+        state.message = f"Step 2 failed: rc={result['returncode']}"
+    refresh_step_states(state)
+    return result
+
+
+def run_step3_for_state(state: WorkflowState) -> dict:
+    """Run Step 3 (normalize configurations) on the current filter scope."""
+    result = _run_step_subprocess(
+        state,
+        ["python", "scripts/step3_normalize_configs.py", "--json"],
+    )
+    if result["ok"]:
+        state.errors = []
+        try:
+            payload = json.loads(result["stdout"])
+            state.message = (
+                f"Step 3: deterministic={payload.get('n_deterministic', 0)} "
+                f"empty_or_default={payload.get('n_empty_or_default', 0)} "
+                f"total_configs={payload.get('total_configurations', 0)}"
+            )
+        except json.JSONDecodeError:
+            state.message = "Step 3: completed (unparseable --json output)"
+    else:
+        state.errors = [result["stderr"][-500:]]
+        state.message = f"Step 3 failed: rc={result['returncode']}"
+    refresh_step_states(state)
+    return result
+
+
+def run_step4_for_state(state: WorkflowState) -> dict:
+    """Run Step 4 (resolve every part number) on the current filter scope."""
+    result = _run_step_subprocess(
+        state,
+        ["python", "scripts/step4_resolve_spec.py", "--all", "--json"],
+    )
+    if result["ok"]:
+        state.errors = []
+        try:
+            payload = json.loads(result["stdout"])
+            state.message = (
+                f"Step 4: schema_valid={payload.get('n_schema_valid', 0)}/"
+                f"{payload.get('n', 0)} unresolved={payload.get('n_with_unresolved', 0)}"
+            )
+        except json.JSONDecodeError:
+            state.message = "Step 4: completed (unparseable --json output)"
+    else:
+        state.errors = [result["stderr"][-500:]]
+        state.message = f"Step 4 failed: rc={result['returncode']}"
+    refresh_step_states(state)
+    return result
+
+
+def refresh_step_states(state: WorkflowState) -> None:
+    """Update each step's status field based on what output files exist on disk."""
+    reviews_dir = state.output_dir / "feature_templates_reviewed"
+    configs_dir = state.output_dir / "normalized_configs"
+    resolved_dir = state.output_dir / "resolved_specs"
+
+    has_reviews = reviews_dir.exists() and any(reviews_dir.glob("*.review.json"))
+    has_configs = configs_dir.exists() and any(configs_dir.glob("*.configurations.json"))
+    has_resolved = resolved_dir.exists() and any(resolved_dir.glob("*.resolved_cad_spec.json"))
+
+    for step in state.steps:
+        if step.key == "step2_review":
+            step.status = "done" if has_reviews else "ready"
+        elif step.key == "step3_normalize":
+            step.status = "done" if has_configs else "ready"
+        elif step.key == "step4_resolve":
+            step.status = "done" if has_resolved else "ready"
 
 
 def latest_step1_jsonl(state: WorkflowState) -> Path:
@@ -381,6 +499,10 @@ def run_textual_app(state: WorkflowState) -> None:
             Binding("f", "force_step0", "Force Step0", show=False),
             Binding("j", "step1_jsonl", "JSONL", show=False),
             Binding("b", "both", "Both", show=False),
+            Binding("2", "step2_review", "Step2", show=False),
+            Binding("3", "step3_normalize", "Step3", show=False),
+            Binding("4", "step4_resolve", "Step4", show=False),
+            Binding("A", "run_234", "Steps 2-4", show=False),
             Binding("u", "submit_batch", "Submit"),
             Binding("c", "batch_monitor", "Monitor"),
             Binding("d", "download_batch", "Output"),
@@ -463,6 +585,8 @@ def run_textual_app(state: WorkflowState) -> None:
                 self.workflow_state.page = min(self.workflow_state.page, max_page)
                 batch_row = latest_batch_job(conn)
                 batch_rows = list_batch_jobs(conn, limit=min(self.workflow_state.page_size, 100))
+
+            refresh_step_states(self.workflow_state)
 
             batch_summary = "Batch\nnone"
             if batch_row:
@@ -629,6 +753,48 @@ def run_textual_app(state: WorkflowState) -> None:
         async def action_step1_jsonl(self) -> None:
             await self.run_work("Creating Step 1 JSONL", run_step1_jsonl_for_state, self.workflow_state)
 
+        async def action_step2_review(self) -> None:
+            self.workflow_state.step_cursor = self._step_index("step2_review")
+            self.progress_total = 1
+            self.progress_done = 0
+            self.query_one("#progress", ProgressBar).update(total=1, progress=0)
+            await self.run_work("Running Step 2 (review templates)", run_step2_for_state, self.workflow_state)
+            refresh_step_states(self.workflow_state)
+            self.refresh_view()
+
+        async def action_step3_normalize(self) -> None:
+            self.workflow_state.step_cursor = self._step_index("step3_normalize")
+            self.progress_total = 1
+            self.progress_done = 0
+            self.query_one("#progress", ProgressBar).update(total=1, progress=0)
+            await self.run_work("Running Step 3 (normalize configs)", run_step3_for_state, self.workflow_state)
+            refresh_step_states(self.workflow_state)
+            self.refresh_view()
+
+        async def action_step4_resolve(self) -> None:
+            self.workflow_state.step_cursor = self._step_index("step4_resolve")
+            self.progress_total = 1
+            self.progress_done = 0
+            self.query_one("#progress", ProgressBar).update(total=1, progress=0)
+            await self.run_work("Running Step 4 (resolve part numbers)", run_step4_for_state, self.workflow_state)
+            refresh_step_states(self.workflow_state)
+            self.refresh_view()
+
+        async def action_run_234(self) -> None:
+            """Run Steps 2, 3, and 4 in sequence on the current filter scope."""
+            await self.action_step2_review()
+            if self.workflow_state.errors:
+                self.workflow_state.message = "Steps 2-4 aborted after Step 2 failure"
+                self.refresh_view()
+                return
+            await self.action_step3_normalize()
+            if self.workflow_state.errors:
+                self.workflow_state.message = "Steps 2-4 aborted after Step 3 failure"
+                self.refresh_view()
+                return
+            await self.action_step4_resolve()
+            self.refresh_view()
+
         async def action_submit_batch(self) -> None:
             await self.run_work("Submitting latest Step 1 batch JSONL", submit_latest_batch_for_state, self.workflow_state)
             if known_batches_need_sync(self.workflow_state):
@@ -667,8 +833,20 @@ def run_textual_app(state: WorkflowState) -> None:
                     await self.run_work("Running Step 1 batch action", run_step1_batch_for_state, self.workflow_state)
                     if known_batches_need_sync(self.workflow_state):
                         self.start_batch_monitor()
+                elif key == "step2_review":
+                    await self.action_step2_review()
+                elif key == "step3_normalize":
+                    await self.action_step3_normalize()
+                elif key == "step4_resolve":
+                    await self.action_step4_resolve()
             self.workflow_state.message = f"Finished selected steps: {selected_step_labels(self.workflow_state)}"
             self.refresh_view()
+
+        def _step_index(self, key: str) -> int:
+            for i, step in enumerate(self.workflow_state.steps):
+                if step.key == key:
+                    return i
+            return 0
 
         def action_step_up(self) -> None:
             self.set_step_cursor(self.next_enabled_step_index(-1))
