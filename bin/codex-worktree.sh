@@ -84,11 +84,15 @@ REPO_ROOT="$(git rev-parse --show-toplevel)"
 REPO_NAME="$(basename "$REPO_ROOT")"
 ORIGINAL_BRANCH="$(git rev-parse --abbrev-ref HEAD)"
 
-if [[ -n "$(git status --porcelain)" ]]; then
-  echo "ERROR: working tree is not clean. Commit or stash before running." >&2
-  git status --short >&2
+if [[ -n "$(git status --porcelain --untracked-files=no)" ]]; then
+  echo "ERROR: tracked files have uncommitted changes. Commit or stash before running." >&2
+  git status --short --untracked-files=no >&2
   exit 1
 fi
+
+# Untracked files are allowed — they don't conflict with the worktree, which
+# is a separate checkout. If a file with the same name exists in the worktree,
+# that's the worktree's problem, not ours.
 
 # Pick a worktree location. Sibling to the repo so it doesn't pollute the
 # repo dir, and easy to spot in `git worktree list`.
@@ -145,9 +149,9 @@ echo "==> Diff summary vs $ORIGINAL_BRANCH"
   git fetch .. "$ORIGINAL_BRANCH:$ORIGINAL_BRANCH" 2>/dev/null || true
   git diff --stat "$ORIGINAL_BRANCH"..HEAD
   echo
-  if [[ -n "$(git status --porcelain)" ]]; then
+  if [[ -n "$(git status --porcelain --untracked-files=no)" ]]; then
     echo "Uncommitted changes still in worktree:"
-    git status --short
+    git status --short --untracked-files=no
   else
     echo "(no uncommitted changes in worktree; everything was committed)"
   fi
