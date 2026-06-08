@@ -182,23 +182,71 @@ def evaluate_template(template: dict[str, Any]) -> dict[str, Any]:
     Returns a dict with both views, plus structural_issues and cad_ready.
     """
     # ----- resolve candidate key sets ----------------------------------
-    schema_params_list = template.get("parameters", []) or []
-    schema_features_list = template.get("feature_graph", []) or []
-    schema_components_list = template.get("components", []) or []
-    schema_validation_list = template.get("validation_requirements", []) or []
+    # Helper: coerce a field that "should" be a list to a list. Some models
+    # emit feature_graph as a dict (e.g. {"F1": {...}, "F2": {...}}); others
+    # emit `parameters` as a dict keyed by symbol. We unwrap to the values
+    # in that case. Missing/None becomes [].
+    def _as_list(v: Any) -> list[Any]:
+        if v is None:
+            return []
+        if isinstance(v, list):
+            return v
+        if isinstance(v, dict):
+            return [item for item in v.values() if item is not None]
+        return []
+
+    # Some models wrap the whole template under a single key (e.g.
+    # gemini-3-flash-preview on part 110302255160 emitted
+    # {"part_specification": {parameters, features, ...}}). Detect that and
+    # look one level deep.
+    _WRAPPER_KEYS = ("part_specification", "specification", "template", "result")
+    def _unwrap(t: dict[str, Any]) -> dict[str, Any]:
+        for k in _WRAPPER_KEYS:
+            inner = t.get(k)
+            if isinstance(inner, dict) and any(
+                fld in inner for fld in ("parameters", "features", "feature_graph",
+                                          "geometric_features", "components",
+                                          "validation_checks", "validation_requirements",
+                                          "part_family_metadata", "metadata",
+                                          "missing_information", "assumptions")
+            ):
+                # Merge wrapper-into-top-level: prefer the wrapper for any
+                # field it provides, fall back to the original top-level.
+                merged = dict(t)
+                merged.update(inner)
+                # Preserve the wrapper itself for debugging/inspection
+                merged["_wrapper_detected"] = k
+                return merged
+        return t
+
+    template = _unwrap(template)
+
+    schema_params_list = _as_list(template.get("parameters"))
+    schema_features_list = _as_list(template.get("feature_graph"))
+    schema_components_list = _as_list(template.get("components"))
+    schema_validation_list = _as_list(template.get("validation_requirements"))
     schema_catalog = template.get("catalog_metadata", {}) or {}
-    schema_missing = template.get("missing_information", []) or []
-    schema_assumptions = template.get("assumptions", []) or []
+    schema_missing = _as_list(template.get("missing_information"))
+    schema_assumptions = _as_list(template.get("assumptions"))
 
     # Native shapes observed on local Ollama models:
     #   parameters[{symbol, description, unit|units, ...}]
-    #   features[{feature_id, feature_type, ...}]
+    #   features[{feature_id, feature_type, ...}]   (qwen3.6 / minimax-m3)
+    #   geometric_features[{feature_id, ...}]       (gemini-3-flash-preview)
     #   validation_checks[{check_type, ...}]
-    #   metadata{...}
-    native_params_list = template.get("parameters", []) or []  # same key, simpler shape
-    native_features_list = template.get("features", []) or []
-    native_validation_list = template.get("validation_checks", []) or []
-    native_catalog = template.get("metadata", {}) or {}
+    #   metadata{...} / part_family_metadata{...}
+    native_params_list = _as_list(template.get("parameters"))
+    # Union of all observed feature-list key names. Pick the first non-empty.
+    native_features_list = (
+        _as_list(template.get("geometric_features"))
+        or _as_list(template.get("features"))
+    )
+    native_validation_list = _as_list(template.get("validation_checks"))
+    native_catalog = (
+        template.get("part_family_metadata")
+        or template.get("metadata")
+        or {}
+    )
     # `assumptions` is sometimes the same; check both
     native_assumptions = native_catalog.get("assumptions", []) if isinstance(native_catalog, dict) else []
     if not native_assumptions:
@@ -226,12 +274,35 @@ def evaluate_template(template: dict[str, Any]) -> dict[str, Any]:
     def feature_dep(f: Any) -> list[Any]:
         if not isinstance(f, dict):
             return []
-        return f.get("depends_on") or f.get("dependencies") or []
+        raw = f.get("depends_on") or f.get("dependencies") or []
+        out: list[Any] = []
+        for item in raw:
+            if isinstance(item, str):
+                out.append(item)
+            elif isinstance(item, list):
+                for sub in item:
+                    if isinstance(sub, str):
+                        out.append(sub)
+            elif item is not None:
+                out.append(str(item))
+        return out
 
     def feature_target_bodies(f: Any) -> list[Any]:
         if not isinstance(f, dict):
             return []
-        return f.get("target_bodies") or ([f.get("target_body")] if f.get("target_body") else [])
+        raw = f.get("target_bodies") or ([f.get("target_body")] if f.get("target_body") else [])
+        # Flatten and stringify: some models nest lists, or mix strings+lists
+        out: list[Any] = []
+        for item in raw:
+            if isinstance(item, str):
+                out.append(item)
+            elif isinstance(item, list):
+                for sub in item:
+                    if isinstance(sub, str):
+                        out.append(sub)
+            elif item is not None:
+                out.append(str(item))
+        return out
 
     def feature_output_bodies(f: Any) -> list[Any]:
         if not isinstance(f, dict):
@@ -282,8 +353,10 @@ def evaluate_template(template: dict[str, Any]) -> dict[str, Any]:
             1
             for p in param_list
             if isinstance(p, dict)
-            and p.get("default_value") is not None
+            and (p.get("default_value") is not None
+                 or p.get("value") is not None)
             and p.get("default_value") != ""
+            and p.get("value") != ""
         )
         needs_review_features = sum(1 for f in feat_list if needs_review_flag(f))
         confs = [confidence_value(f) for f in feat_list]
