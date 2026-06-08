@@ -105,6 +105,70 @@ cad-template-pipeline/
 
 ---
 
+## Codex Development Workflow
+
+Every Codex-driven coding session in this repo runs through `bin/codex-worktree.sh`, a wrapper around `git worktree` + `codex exec`. This prevents `git commit` from racing with Codex's own edits to the same files, and gives every Codex session its own branch for clean rollback.
+
+### What the wrapper does
+
+1. Verifies the working tree has no uncommitted changes to **tracked** files (untracked files are allowed — they don't conflict with the worktree, which is a separate checkout).
+2. Creates a new branch in a sibling worktree at `../<repo-name>.wt.<branch-name>/`.
+3. Runs `codex exec` inside the worktree, forwarding any extra flags (e.g. `--model`, `--reasoning`).
+4. On success: shows a diff summary, then prompts before merging with `--no-ff` (default: **N**, so the human stays in the loop).
+5. On failure: leaves the worktree in place for inspection and prints the cleanup commands.
+6. On merge success: removes the worktree and deletes the temporary branch.
+
+### Usage
+
+```bash
+# Typical: write a detailed prompt to a file, then run the wrapper.
+cat > /tmp/prompt.md <<'EOF'
+You are editing scripts/step5_codegen.py. Implement ...
+EOF
+
+bin/codex-worktree.sh step5-codegen /tmp/prompt.md
+
+# With Codex flags forwarded:
+bin/codex-worktree.sh step5-codegen /tmp/prompt.md \
+  -m gpt-5.4-mini \
+  -c model_reasoning_effort=low
+
+# Inline string prompt:
+bin/codex-worktree.sh fix-readme-typo "Fix typos in README.md"
+```
+
+### Safety properties
+
+- **Refuses to clobber** an existing worktree or branch.
+- **Forwards all extra args** to `codex exec` after the prompt, so `--model`, `--sandbox`, `--reasoning` etc. all work.
+- **Prompt-as-file** preferred: write a long prompt to a file rather than passing a multi-line string, so the prompt is reviewable in version control if you want to.
+- **`--no-ff` merge** so every Codex session shows up as a real merge commit in history (visible with `git log --graph`).
+- **Worktree cleanup** is automatic on merge success; on failure the worktree is preserved so you can `cd` into it and inspect.
+
+### Failure handling
+
+If `codex exec` returns non-zero (e.g. usage limit, model error, sandbox denial):
+
+```text
+==> Codex exited with code 1
+    Worktree left in place at: /home/keji/fe/cadquery_generator/../cadquery_generator.wt.<branch>
+    Inspect with:  cd /home/keji/fe/cadquery_generator/../cadquery_generator.wt.<branch> && git status
+    Discard with: git worktree remove --force /home/keji/fe/cadquery_generator/../cadquery_generator.wt.<branch> && git branch -D <branch>
+```
+
+If you decline the merge prompt (`N`):
+
+```text
+==> Skipping merge. Worktree left in place at: /home/keji/fe/cadquery_generator/../cadquery_generator.wt.<branch>
+    To merge later: cd /home/keji/fe/cadquery_generator && git merge --no-ff <branch>
+```
+
+### Why a wrapper instead of `--worktree` flag
+
+`codex exec` does not have a built-in `--worktree` flag. The Hermes Codex skill documents the same pattern: `git worktree add -b <branch> <path> <base>` → `codex exec` → `git worktree remove`. The wrapper just automates the cycle and adds the merge prompt + diff summary that you'd otherwise have to do by hand.
+
+---
+
 ## TUI Workflow
 
 Install local dependencies:
