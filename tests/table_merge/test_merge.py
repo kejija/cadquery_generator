@@ -107,7 +107,8 @@ def test_merge_variant_lookup_first_column_used_when_no_primary_key():
            rows=[[8, 7, 0.5], [12, 9, 0.5]]),
     ]
     out = merge_tables(tables)
-    keys = sorted(r.get("No.") for r in out.rows)
+    # "No." resolves to canonical "size_no" via DEFAULT_SYNONYMS.
+    keys = sorted(r.get("size_no") for r in out.rows)
     assert keys == [8, 10, 12]
     # D=8 has matching values across A and B -> no conflict.
     assert out.conflicts == []
@@ -126,10 +127,12 @@ def test_merge_dimension_tables_joins_by_model_number():
     ]
     out = merge_tables(tables)
     # X1 appears in both, no conflict. X2 only A, X3 only B.
-    keys = sorted(r.get("Model Number") for r in out.rows)
+    # The merge forces the first-column canonical to "model_number" so
+    # "Model Number" and "PartNumber" both become that.
+    keys = sorted(r.get("model_number") for r in out.rows)
     assert keys == ["X1", "X2", "X3"]
-    # OD must be canonicalized (Model Number -> "Model Number", PartNumber -> "model_number")
-    x1 = next(r for r in out.rows if r.get("Model Number") == "X1")
+    # OD must be canonicalized (Model Number -> "model_number", PartNumber -> "model_number")
+    x1 = next(r for r in out.rows if r.get("model_number") == "X1")
     assert "OD" in x1
     # No conflict because A and B agree on OD=47 for X1.
     assert out.conflicts == []
@@ -164,7 +167,7 @@ def test_merge_dimension_tables_missing_values_kept_missing():
            rows=[["X1", 47]]),  # missing ID
     ]
     out = merge_tables(tables)
-    x1 = next(r for r in out.rows if r.get("Model") == "X1")
+    x1 = next(r for r in out.rows if r.get("model_number") == "X1")
     assert x1.get("OD") == 47
     assert x1.get("ID") == 20
     # No conflict for missing values.
