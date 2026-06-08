@@ -1,0 +1,119 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://cadquery.local/schemas/resolved_cad_spec.schema.json",
+  "title": "ResolvedCadSpec",
+  "description": "Step 4 output: a feature template with every parameter_value substituted to concrete numbers/strings for a single selected part number. No $D-style placeholders remain.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "template_id",
+    "catalog_id",
+    "part_number",
+    "variant",
+    "units",
+    "parameter_bindings",
+    "resolved_features",
+    "coordinate_system",
+    "components"
+  ],
+  "properties": {
+    "schema_version": { "type": "string" },
+    "template_id": { "type": "string" },
+    "catalog_id": { "type": "string" },
+    "part_number": { "type": "string" },
+    "variant": { "type": "string" },
+    "units": { "type": "string", "enum": ["mm", "in"] },
+    "parameter_bindings": {
+      "type": "object",
+      "description": "Flat map of every template parameter name -> resolved value. Keys include both top-level parameters[] and feature_graph parameters.",
+      "additionalProperties": {}
+    },
+    "unresolved_references": {
+      "type": "array",
+      "description": "List of parameter references that could not be resolved (informational; spec is still emitted).",
+      "items": {
+        "type": "object",
+        "required": ["feature_id", "parameter_name", "raw_value"],
+        "properties": {
+          "feature_id": { "type": "string" },
+          "parameter_name": { "type": "string" },
+          "raw_value": { "type": ["string", "number", "null"] }
+        }
+      }
+    },
+    "coordinate_system": {
+      "type": "object",
+      "required": ["origin", "x_axis", "y_axis", "z_axis"],
+      "properties": {
+        "origin": { "type": "string" },
+        "x_axis": { "type": "string" },
+        "y_axis": { "type": "string" },
+        "z_axis": { "type": "string" }
+      }
+    },
+    "components": {
+      "type": "array",
+      "items": { "type": "object" }
+    },
+    "resolved_features": {
+      "type": "array",
+      "description": "Feature graph with every parameter value bound to a concrete number/string.",
+      "items": {
+        "type": "object",
+        "required": ["id", "feature_type", "operation", "modeling_primitive", "parameters"],
+        "properties": {
+          "id": { "type": "string" },
+          "feature_type": { "type": "string" },
+          "operation": { "type": "string" },
+          "modeling_primitive": { "type": "string" },
+          "subtype": { "type": ["string", "null"] },
+          "target_bodies": {
+            "type": "array",
+            "items": { "type": "string" }
+          },
+          "output_bodies": {
+            "type": "array",
+            "items": { "type": "string" }
+          },
+          "depends_on": {
+            "type": "array",
+            "items": { "type": "string" }
+          },
+          "parameters": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["name", "value", "role"],
+              "properties": {
+                "name": { "type": "string" },
+                "value": {},
+                "role": { "type": "string" },
+                "source": {
+                  "type": "string",
+                  "enum": [
+                    "configuration_row",
+                    "template_default",
+                    "carried_over",
+                    "missing"
+                  ]
+                }
+              }
+            }
+          },
+          "construction": { "type": "object" },
+          "position": { "type": "object" },
+          "axis": { "type": ["string", "null"] },
+          "side": { "type": ["string", "null"] },
+          "pattern": { "type": "object" },
+          "needs_review": { "type": "boolean" },
+          "review_reason": { "type": ["string", "null"] }
+        }
+      }
+    },
+    "review_flags": {
+      "type": "array",
+      "description": "Step 2 review flags inherited from the template, carried through so Step 5/6 can decide whether to proceed.",
+      "items": { "type": "string" }
+    }
+  }
+}

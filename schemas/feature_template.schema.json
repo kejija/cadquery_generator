@@ -1,0 +1,209 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://cadquery.local/schemas/feature_template.schema.json",
+  "title": "EngineeringFeatureTemplate",
+  "description": "Reusable CAD-construction-ready feature template produced by Step 1 (drawing + datasheet). Consumed by Step 2 (review) and Step 4 (resolve).",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "template_id",
+    "part_family",
+    "units",
+    "modeling_mode",
+    "coordinate_system",
+    "components",
+    "parameters",
+    "feature_graph"
+  ],
+  "properties": {
+    "schema_version": { "type": "string" },
+    "template_id": {
+      "type": "string",
+      "description": "Stable identifier for this template (one per part family)."
+    },
+    "part_family": {
+      "type": "string",
+      "description": "Human-readable part family name."
+    },
+    "units": {
+      "type": "string",
+      "description": "Linear units used throughout the template. Conventional values: 'mm', 'in'. Step 2 flags other values as needs_review."
+    },
+    "modeling_mode": {
+      "type": "string",
+      "description": "Conventional: simplified_single_body, multi_body_part, assembly. Step 2 flags unexpected values."
+    },
+    "coordinate_system": {
+      "type": "object",
+      "required": ["origin", "x_axis", "y_axis", "z_axis"],
+      "properties": {
+        "origin": { "type": "string" },
+        "x_axis": { "type": "string" },
+        "y_axis": { "type": "string" },
+        "z_axis": { "type": "string" }
+      }
+    },
+    "components": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "name", "component_type"],
+        "properties": {
+          "id": { "type": "string" },
+          "name": { "type": "string" },
+          "component_type": { "type": "string" },
+          "description": { "type": "string" },
+          "parent_component": { "type": ["string", "null"] },
+          "created_by_feature": { "type": ["string", "null"] }
+        }
+      }
+    },
+    "parameters": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name"],
+        "properties": {
+          "name": { "type": "string" },
+          "symbol": { "type": "string" },
+          "description": { "type": "string" },
+          "parameter_type": {
+            "type": "string",
+            "description": "Conventional values: length, diameter, angle, integer, string, material, boolean, count, surface_finish, thread, tolerance, enum, unknown. Step 2 flags unknown/unexpected values as needs_review."
+          },
+          "category": {
+            "type": "string",
+            "description": "Conventional: geometry, catalog, tolerance, metadata, material. Step 2 flags unexpected values."
+          },
+          "source": { "type": "string" },
+          "default_value": {},
+          "units": { "type": ["string", "null"] },
+          "tolerance": { "type": ["string", "null"] },
+          "notes": { "type": "string" }
+        }
+      }
+    },
+    "feature_graph": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "id",
+          "feature_type",
+          "operation",
+          "modeling_primitive",
+          "target_bodies",
+          "output_bodies",
+          "parameters",
+          "confidence",
+          "needs_review"
+        ],
+        "properties": {
+          "id": { "type": "string" },
+          "feature_type": {
+            "type": "string",
+            "description": "Conventional: base_body, hole, pocket, boss, slot, chamfer, fillet, pattern, cut, rib, draft. Step 2 flags unexpected values."
+          },
+          "operation": {
+            "type": "string",
+            "description": "Conventional: base, add, subtract, modify. Step 2 flags unexpected values."
+          },
+          "modeling_primitive": {
+            "type": "string",
+            "description": "Lower-case primitive name; 'unknown' is allowed only when needs_review=true."
+          },
+          "subtype": { "type": "string" },
+          "target_bodies": {
+            "type": "array",
+            "items": { "type": "string" }
+          },
+          "output_bodies": {
+            "type": "array",
+            "items": { "type": "string" }
+          },
+          "depends_on": {
+            "type": "array",
+            "items": { "type": "string" }
+          },
+          "parameters": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["name", "role"],
+              "properties": {
+                "name": { "type": "string" },
+                "value": {},
+                "role": {
+                  "type": "string",
+                  "description": "Conventional: driving_dimension, reference, selector, tolerance. Step 2 flags other values."
+                }
+              }
+            }
+          },
+          "construction": {
+            "type": ["object", "null"],
+            "properties": {
+              "sketch_plane": { "type": ["string", "null"] },
+              "reference_plane": { "type": ["string", "null"] },
+              "profile_type": { "type": ["string", "null"] },
+              "profile_description": { "type": ["string", "null"] },
+              "start_condition": { "type": ["string", "null"] },
+              "end_condition": { "type": ["string", "null"] },
+              "depth": { "type": ["string", "number", "null"] },
+              "boolean_scope": { "type": ["string", "null"] },
+              "construction_notes": { "type": ["string", "null"] }
+            }
+          },
+          "position": {
+            "type": ["object", "null"],
+            "properties": {
+              "x": { "type": ["number", "string", "null"] },
+              "y": { "type": ["number", "string", "null"] },
+              "z": { "type": ["number", "string", "null"] }
+            }
+          },
+          "axis": {
+            "type": ["string", "null"],
+            "description": "Conventional: X, Y, Z. Free-text values like 'normal_to_face' are allowed; Step 2 flags when a hole/pocket has axis=null AND not needs_review."
+          },
+          "side": {
+            "type": ["string", "null"],
+            "description": "Conventional: left, right, top, bottom, front, back, both. Step 2 flags unexpected values."
+          },
+          "pattern": {
+            "type": ["object", "null"],
+            "properties": {
+              "pattern_type": { "type": "string" },
+              "count": { "type": ["integer", "string", "null"] },
+              "spacing": { "type": ["number", "string", "null"] },
+              "angle_step": { "type": ["number", "string", "null"] },
+              "direction": { "type": ["string", "null"] },
+              "base_feature": { "type": ["string", "null"] }
+            }
+          },
+          "confidence": {
+            "type": "number",
+            "minimum": 0.0,
+            "maximum": 1.0
+          },
+          "needs_review": { "type": "boolean" },
+          "review_reason": { "type": "string" },
+          "notes": { "type": "string" }
+        }
+      }
+    },
+    "catalog_metadata": { "type": "object" },
+    "assumptions": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "missing_information": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "validation_requirements": {
+      "type": "array",
+      "items": { "type": ["string", "object", "number", "boolean", "null"] }
+    }
+  }
+}

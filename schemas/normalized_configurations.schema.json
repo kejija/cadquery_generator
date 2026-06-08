@@ -1,0 +1,86 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://cadquery.local/schemas/normalized_configurations.schema.json",
+  "title": "NormalizedConfigurations",
+  "description": "Step 3 output: clean, one-row-per-part-number configuration table for a part family, joined to the Step 1 feature template's parameter symbols.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "catalog_id",
+    "source_template_id",
+    "units",
+    "parameter_symbols",
+    "configurations"
+  ],
+  "properties": {
+    "schema_version": { "type": "string" },
+    "catalog_id": {
+      "type": "string",
+      "description": "Stable id for this catalog row set. Conventionally matches template_id."
+    },
+    "source_template_id": {
+      "type": "string",
+      "description": "Step 1 template_id this catalog was derived from."
+    },
+    "source_component_id": {
+      "type": ["string", "null"],
+      "description": "MISUMI component folder id (e.g. 110300324920) used as the primary scrape source."
+    },
+    "units": {
+      "type": "string",
+      "enum": ["mm", "in"]
+    },
+    "parameter_symbols": {
+      "type": "array",
+      "description": "Ordered list of dimension symbols this catalog exposes, drawn from the template's parameter symbols.",
+      "items": { "type": "string" }
+    },
+    "configurations": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["part_number", "variant", "values"],
+        "properties": {
+          "part_number": {
+            "type": "string",
+            "description": "MISUMI catalog part number, e.g. 'MCSCS10'."
+          },
+          "variant": {
+            "type": "string",
+            "description": "Variant label parsed from configuration column when present; 'standard' when not."
+          },
+          "values": {
+            "type": "object",
+            "description": "Map of parameter_symbol -> value. Numeric values stored as numbers; thread specs (e.g. 'M5') as strings; missing values as null.",
+            "additionalProperties": { "type": ["number", "string", "null", "boolean"] }
+          },
+          "source_table_idx": {
+            "type": ["integer", "null"],
+            "description": "Index into the original specs.json tables array this row came from."
+          },
+          "source_row_idx": {
+            "type": ["integer", "null"],
+            "description": "Row index within that table."
+          }
+        }
+      }
+    },
+    "extraction": {
+      "type": "object",
+      "description": "Provenance / diagnostics metadata about how the catalog was extracted.",
+      "properties": {
+        "method": {
+          "type": "string",
+          "enum": ["deterministic", "codex_assisted", "empty", "single_row_default"]
+        },
+        "tables_scanned": { "type": "integer" },
+        "tables_with_part_numbers": { "type": "integer" },
+        "rows_emitted": { "type": "integer" },
+        "warnings": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      }
+    }
+  }
+}
