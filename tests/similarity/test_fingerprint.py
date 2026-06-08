@@ -68,6 +68,18 @@ def test_part_family_fallback_returns_unknown_for_unrecognized():
     assert _normalize_category("", "Mystery Gizmo 9000") == "unknown"
 
 
+def test_yaml_category_names_normalize_to_sensible_roots():
+    """Regression: real YAML category names should resolve to known roots."""
+    # From data/hierachy_enriched_final.yaml, sampled:
+    assert _normalize_category("", "Cantilever Shafts") == "shaft"
+    assert _normalize_category("", "Liquid Pumps") == "pump"
+    assert _normalize_category("", "Locating Pins & Bushings") == "bushing"
+    assert _normalize_category("", "Ball & Roller Bearings") == "bearing"
+    assert _normalize_category("", "Quick Connect Couplers & Joints") == "coupler"
+    assert _normalize_category("", "Door Wheels") == "wheel"
+    assert _normalize_category("", "Aluminum Extrusions & Accessories") == "extrusion"
+
+
 def test_explicit_category_code_wins_over_part_family_fallback():
     # If a category_code is present, the part_family fallback is NOT used.
     # This is the override rule: explicit metadata beats text inference.
