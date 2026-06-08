@@ -8,3 +8,7 @@ outputs/
 outputs_*/
 output/
 qc_*/
+.venv-sim/
+.chroma/
+__pycache__/
+*.pyc
