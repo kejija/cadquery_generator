@@ -230,3 +230,132 @@ def test_pocket_cut_extrude_skips_symbolic_width():
     assert reason == "cut_extrude requires numeric width and length"
     assert "not_implemented.append('f_slot')" in code
     assert "# TODO" in code
+
+
+# ---------------------------------------------------------------------------
+# Symbol bindings (Step 4.5) — the apply_symbol_bindings helper
+# ---------------------------------------------------------------------------
+
+def test_apply_symbol_bindings_replaces_string_values_in_place():
+    """A symbol binding {'D': 20.0} should replace 'D' in feature parameters
+    with 20.0, tag the parameter with value_source='binding', and not touch
+    other string values that aren't in the bindings."""
+    spec = {
+        "resolved_features": [
+            {
+                "id": "f1",
+                "parameters": [
+                    {"name": "D", "value": "D", "role": "driving_dimension"},
+                    {"name": "M", "value": "M", "role": "driving_dimension"},
+                    {"name": "F", "value": 15.0, "role": "driving_dimension"},  # already numeric
+                ],
+            }
+        ]
+    }
+    n = step5_codegen.apply_symbol_bindings(spec, {"D": 20.0, "F": 99.0})
+    assert n == 1  # only 'D' was substituted (F was already numeric)
+    p = spec["resolved_features"][0]["parameters"]
+    assert p[0]["value"] == 20.0
+    assert p[0]["value_source"] == "binding"
+    assert p[0]["bound_from_symbol"] == "D"
+    assert p[1]["value"] == "M"  # not in bindings, untouched
+    assert p[2]["value"] == 15.0  # already numeric, untouched
+
+
+def test_apply_symbol_bindings_no_op_when_empty():
+    """Empty bindings dict should be a no-op (returns 0, no mutations)."""
+    spec = {
+        "resolved_features": [
+            {"id": "f1", "parameters": [{"name": "D", "value": "D"}]}
+        ]
+    }
+    n = step5_codegen.apply_symbol_bindings(spec, {})
+    assert n == 0
+    assert spec["resolved_features"][0]["parameters"][0]["value"] == "D"
+
+
+def test_load_symbol_bindings_missing_file():
+    """load_symbol_bindings should return {} when the file doesn't exist
+    (not raise)."""
+    fake = REPO_ROOT / "output" / "_does_not_exist_symbol_bindings.json"
+    if fake.exists():
+        fake.unlink()
+    bindings = step5_codegen.load_symbol_bindings(fake)
+    assert bindings == {}
+
+
+def test_load_symbol_bindings_real_file(tmp_path):
+    """A well-formed bindings file should be loaded and returned as-is."""
+    p = tmp_path / "bindings.json"
+    p.write_text(json.dumps({
+        "110310764189__SH-PSSGTN20": {"D": 20.0, "M": 20.0, "P": 17.5},
+        "110300324920__MCSCN10": {"hex_width_across_flats": 17.0},
+    }))
+    bindings = step5_codegen.load_symbol_bindings(p)
+    assert "110310764189__SH-PSSGTN20" in bindings
+    assert bindings["110310764189__SH-PSSGTN20"]["D"] == 20.0
+
+
+def test_end_to_end_with_symbol_bindings(tmp_path):
+    """Build a minimal spec, write a bindings file, run process_spec, and
+    verify the binding was applied (the resulting model.py should contain
+    the resolved numeric value, not the symbolic reference)."""
+    # Minimal spec with one feature whose D and L are string symbols
+    spec = {
+        "schema_version": "1.0",
+        "template_id": "test_fixture",
+        "catalog_id": "test_fixture",
+        "part_number": "TESTPN",
+        "variant": "standard",
+        "units": "mm",
+        "parameter_bindings": {},
+        "unresolved_references": [],
+        "coordinate_system": {
+            "origin": "x", "x_axis": "x", "y_axis": "y", "z_axis": "z",
+        },
+        "components": [],
+        "resolved_features": [
+            {
+                "id": "fb1",
+                "feature_type": "base_body",
+                "operation": "base",
+                "modeling_primitive": "extrude",
+                "subtype": "cylindrical",
+                "target_bodies": [],
+                "output_bodies": ["b1"],
+                "depends_on": [],
+                "parameters": [
+                    {"name": "D", "value": "D", "role": "driving_dimension"},
+                    {"name": "L", "value": "L", "role": "driving_dimension"},
+                ],
+                "construction": {
+                    "profile_type": "circle", "depth": "L",
+                },
+                "position": {"x": 0, "y": 0, "z": 0},
+                "axis": "X",
+                "pattern": {"pattern_type": "none"},
+                "confidence": 1.0,
+                "needs_review": False,
+            }
+        ],
+    }
+    spec_path = tmp_path / "test_fixture__TESTPN.resolved_cad_spec.json"
+    spec_path.write_text(json.dumps(spec))
+    bindings_path = tmp_path / "bindings.json"
+    bindings_path.write_text(json.dumps({"test_fixture__TESTPN": {"D": 20.0, "L": 64.5}}))
+
+    schema = json.loads(SCHEMA.read_text())
+    out_dir = tmp_path / "models"
+    r = step5_codegen.process_spec(
+        spec_path, out_dir, schema, smoke=False, bindings={"D": 20.0, "L": 64.5},
+    )
+    assert r.ok, f"process_spec failed: {r.error}"
+    assert r.bindings_applied == 2, f"expected 2 bindings applied, got {r.bindings_applied}"
+    # The generated model.py should have the resolved values (20.0, 64.5),
+    # not 'd' or 'l' as unresolved references.
+    model_code = (out_dir / "TESTPN.model.py").read_text()
+    assert "d = 20.0" in model_code, f"expected 'd = 20.0' declaration in:\n{model_code[:600]}"
+    assert "l = 64.5" in model_code, f"expected 'l = 64.5' declaration in:\n{model_code[:600]}"
+    # The geometry line should reference the declared variables
+    assert "circle(d/2)" in model_code, f"expected 'circle(d/2)' in geometry line in:\n{model_code[:600]}"
+    assert "extrude(l)" in model_code, f"expected 'extrude(l)' in geometry line in:\n{model_code[:600]}"

@@ -70,6 +70,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_SPECS_DIR = REPO_ROOT / "output" / "resolved_specs"
 DEFAULT_OUTPUT_DIR = REPO_ROOT / "output" / "cad_models"
 DEFAULT_SCHEMA = REPO_ROOT / "schemas" / "resolved_cad_spec.schema.json"
+DEFAULT_BINDINGS_FILE = REPO_ROOT / "output" / "symbol_bindings.json"
 
 # Regex: snake_case-ify an arbitrary parameter name.
 _NON_ALNUM = re.compile(r"[^A-Za-z0-9_]+")
@@ -91,6 +92,7 @@ class CodegenResult:
     features_skipped: list[dict] = field(default_factory=list)
     parameters: int = 0
     parameters_null: int = 0
+    bindings_applied: int = 0  # number of symbol→numeric substitutions from symbol_bindings.json
     schema_valid: bool = False
     syntax_valid: bool = False
     runtime_smoke: bool = False
@@ -175,6 +177,44 @@ def binding_value(feature: dict, name: str | None) -> Any:
     if not name:
         return None
     return (feature.get("_parameter_bindings") or {}).get(name)
+
+
+def load_symbol_bindings(path: Path = DEFAULT_BINDINGS_FILE) -> dict[str, dict[str, float]]:
+    """Load output/symbol_bindings.json. Returns empty dict if the file
+    doesn't exist or can't be parsed. The file shape is:
+        {"<cid>__<pn>": {"D": 20.0, "M": 20.0, ...}, ...}
+    """
+    if not path.exists():
+        return {}
+    try:
+        d = json.loads(path.read_text())
+    except Exception:
+        return {}
+    if not isinstance(d, dict):
+        return {}
+    return d
+
+
+def apply_symbol_bindings(spec: dict, bindings: dict[str, float]) -> int:
+    """For each feature's parameters, if a parameter's value is a string
+    symbol that appears in `bindings`, replace it with the numeric value
+    and tag the parameter with `value_source: "binding"` and the binding
+    key. Returns the number of substitutions made.
+
+    Mutates `spec` in place.
+    """
+    if not bindings:
+        return 0
+    n = 0
+    for f in spec.get("resolved_features", []):
+        for p in f.get("parameters", []):
+            v = p.get("value")
+            if isinstance(v, str) and v in bindings:
+                p["value"] = float(bindings[v])
+                p["value_source"] = "binding"
+                p["bound_from_symbol"] = v
+                n += 1
+    return n
 
 
 def numeric_param_expr(feature: dict, candidates: Iterable[str], default: float) -> str:
@@ -727,7 +767,29 @@ def generate_model_py(spec: dict, spec_path: Path) -> tuple[str, int]:
             out.append(f"{v} = {val}  # {name}")
         else:
             out.append(f"{v} = {val!r}  # {name}")
-    # Helpers used in emitters; declare as locals
+
+    # Bound symbol constants: any feature parameter that was resolved via
+    # the symbol_bindings.json (value_source="binding") needs a top-level
+    # constant so the emitter's snake_cased reference (e.g. "d" from
+    # snake("D")) actually resolves. We only emit symbols not already
+    # covered by the parameter_bindings loop above.
+    bound_emitted: set[str] = set()
+    for f in features:
+        for p in f.get("parameters", []):
+            if p.get("value_source") == "binding" and p.get("bound_from_symbol"):
+                sym = p["bound_from_symbol"]
+                if sym in bound_emitted:
+                    continue
+                bound_emitted.add(sym)
+                v = snake(sym)
+                # If the snake name collides with an existing parameter_binding
+                # variable, we still emit it (it's a separate concept — symbol
+                # vs. binding name). The emit will reference it directly.
+                if v in seen and v != sym:
+                    out.append(f"# (symbol {sym!r} shadows parameter binding {v!r}; using binding value)")
+                out.append(f"{v} = {p['value']}  # bound from symbol {sym!r}")
+    if bound_emitted:
+        out.append("")
     out.append("")
     out.append("# ----------------------------------------------------------------------------")
     out.append("# Features (applied in order; unsupported features emit TODO comments)")
@@ -792,6 +854,7 @@ def process_spec(
     *,
     dry_run: bool = False,
     smoke: bool = True,
+    bindings: dict[str, float] | None = None,
 ) -> CodegenResult:
     res = CodegenResult(
         component_id=component_id_of(spec_path),
@@ -817,6 +880,13 @@ def process_spec(
 
     res.features_total = len(spec.get("resolved_features", []))
     res.parameters = len(spec.get("parameter_bindings", {}))
+
+    # Apply symbol bindings (from output/symbol_bindings.json, produced by
+    # scripts/step5_resolve_symbols.py). Replaces string-valued parameters
+    # like 'D' or 'M' with the numeric value Codex resolved. Counted on the
+    # result so callers can see how many symbols were resolved.
+    if bindings:
+        res.bindings_applied = apply_symbol_bindings(spec, bindings)
 
     # Generate
     try:
@@ -890,11 +960,21 @@ def main() -> int:
     p.add_argument("--all", dest="select_all", action="store_true", help="Process all specs")
     p.add_argument("--dry-run", action="store_true", help="Generate but do not write files")
     p.add_argument("--no-smoke", dest="smoke", action="store_false", help="Skip runtime smoke test")
+    p.add_argument("--bindings-file", type=Path, default=DEFAULT_BINDINGS_FILE,
+                   help="Path to symbol_bindings.json (produced by step5_resolve_symbols.py). "
+                        "If absent, no symbol resolution is applied.")
     p.add_argument("--json", dest="json_out", action="store_true", help="Machine-readable summary")
     p.add_argument("--verbose", "-v", action="store_true")
     args = p.parse_args()
 
     schema = json.loads(args.schema.read_text())
+
+    # Load all symbol bindings (keyed by <cid>__<pn>); we'll pass the
+    # per-spec dict to process_spec.
+    all_bindings = load_symbol_bindings(args.bindings_file)
+    if args.verbose and all_bindings:
+        total_syms = sum(len(v) for v in all_bindings.values())
+        print(f"==> Loaded {total_syms} symbol bindings for {len(all_bindings)} spec(s) from {args.bindings_file}", file=sys.stderr)
 
     # Discover
     specs: list[Path] = sorted(args.specs_dir.glob("*.resolved_cad_spec.json"))
@@ -915,14 +995,20 @@ def main() -> int:
 
     results: list[CodegenResult] = []
     for spec_path in specs:
-        r = process_spec(spec_path, args.out_dir, schema, dry_run=args.dry_run, smoke=args.smoke)
+        key = f"{component_id_of(spec_path)}__{part_number_of(spec_path)}"
+        spec_bindings = all_bindings.get(key, {})
+        r = process_spec(
+            spec_path, args.out_dir, schema,
+            dry_run=args.dry_run, smoke=args.smoke, bindings=spec_bindings,
+        )
         results.append(r)
         if args.verbose and not args.json_out:
             status = "OK" if r.ok else f"ERR ({r.error})"
+            bindings_str = f" bindings={r.bindings_applied}" if r.bindings_applied else ""
             print(
                 f"  [{status}] {r.part_number:20s} "
                 f"feat={r.features_total:2d}/{len(r.features_implemented):2d} "
-                f"params={r.parameters}/{r.parameters_null} null",
+                f"params={r.parameters}/{r.parameters_null} null{bindings_str}",
                 file=sys.stderr,
             )
 
