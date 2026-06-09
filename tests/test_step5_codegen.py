@@ -164,3 +164,40 @@ def test_not_implemented_honest_for_unsupported_features():
         f"expected many not_implemented entries for the linear shaft, "
         f"got {v['not_implemented']}"
     )
+
+
+def test_pocket_cut_extrude_emits_geometry():
+    """Pocket cut_extrude should emit a guarded CadQuery cut, not a TODO."""
+    spec = {
+        "part_number": "POCKET_TEST",
+        "catalog_id": "0",
+        "template_id": "unit_test",
+        "parameter_bindings": {"W": 6, "L1": 12, "overall_length": 50},
+        "resolved_features": [
+            {
+                "id": "f_slot",
+                "feature_type": "pocket",
+                "subtype": "side_slot",
+                "modeling_primitive": "cut_extrude",
+                "parameters": [
+                    {"name": "W", "value": 6},
+                    {"name": "L1", "value": 12},
+                ],
+                "construction": {
+                    "profile_type": "rectangle",
+                    "depth": "SC + SX + L1",
+                },
+                "position": {"x": "SC", "y": 0, "z": 0},
+            }
+        ],
+    }
+    code, _ = step5_codegen.generate_model_py(
+        spec, REPO_ROOT / "tests" / "fixtures" / "pocket.resolved_cad_spec.json"
+    )
+    assert "# Feature: f_slot" in code
+    assert "pocket_wp = (" in code
+    assert ".workplane(offset=0, centerOption='CenterOfMass')" in code
+    assert ".rect(w, l1)" in code
+    assert ".extrude(overall_length)" in code
+    assert "feature_log.append('f_slot')" in code
+    assert "not_implemented.append('f_slot')" in code
