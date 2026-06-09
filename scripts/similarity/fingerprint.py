@@ -106,6 +106,8 @@ PART_FAMILY_PREFIX_CATEGORIES: tuple[tuple[str, str], ...] = (
     ("liquid pump", "pump"),
     ("cantilever shaft", "shaft"),
     ("locating pin", "pin"),
+    ("door wheel", "wheel"),
+    ("wheel", "wheel"),
     ("dowel pin", "pin"),
     ("stepped pin", "pin"),
     ("spring pin", "pin"),

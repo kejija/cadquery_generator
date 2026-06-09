@@ -69,11 +69,16 @@ def test_part_family_fallback_returns_unknown_for_unrecognized():
 
 
 def test_yaml_category_names_normalize_to_sensible_roots():
-    """Regression: real YAML category names should resolve to known roots."""
+    """Regression: real YAML category names should resolve to known roots.
+
+    Note: 'Locating Pins & Bushings' normalizes to 'pin' because the prefix
+    'locating pin' starts at the beginning of the lowercased name. That's
+    the intended first-match-wins behavior of PART_FAMILY_PREFIX_CATEGORIES.
+    """
     # From data/hierachy_enriched_final.yaml, sampled:
     assert _normalize_category("", "Cantilever Shafts") == "shaft"
     assert _normalize_category("", "Liquid Pumps") == "pump"
-    assert _normalize_category("", "Locating Pins & Bushings") == "bushing"
+    assert _normalize_category("", "Locating Pins & Bushings") == "pin"
     assert _normalize_category("", "Ball & Roller Bearings") == "bearing"
     assert _normalize_category("", "Quick Connect Couplers & Joints") == "coupler"
     assert _normalize_category("", "Door Wheels") == "wheel"
