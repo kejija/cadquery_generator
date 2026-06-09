@@ -23,7 +23,10 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
+
+if TYPE_CHECKING:
+    from scripts.similarity.category_resolver import CategoryResolution
 
 
 CATEGORY_SYNONYMS: dict[str, str] = {
@@ -269,11 +272,24 @@ def _classify_parameter(param: dict) -> bool:
     return False
 
 
-def build_fingerprint(feature_template_path: Path, component_id: str) -> ComponentFingerprint:
+def build_fingerprint(
+    feature_template_path: Path,
+    component_id: str,
+    category_resolution: Optional["CategoryResolution"] = None,
+    downloads_root: Optional[Path] = None,
+    yaml_path: Optional[Path] = None,
+) -> ComponentFingerprint:
     """Read a feature_template.json and produce a ComponentFingerprint.
 
     Raises FileNotFoundError if the path doesn't exist. Raises ValueError
     with a component_id-tagged message if the JSON is malformed.
+
+    If ``category_resolution`` is provided (from
+    ``scripts.similarity.category_resolver``), its ``category_code`` and
+    ``category_name`` override anything in the feature_template.json. This
+    is the recommended path: the YAML hierarchy is the ground truth for
+    MISUMI categories and is more reliable than the LLM-extracted
+    template metadata.
     """
     import json
 
@@ -332,6 +348,36 @@ def build_fingerprint(feature_template_path: Path, component_id: str) -> Compone
     )
     description = data.get("description", "") or ""
 
+    # Category resolution priority:
+    #   1. Explicit CategoryResolution argument (from category_resolver.py,
+    #      which reads the YAML hierarchy). This is the most reliable source
+    #      for MISUMI catalog components.
+    #   2. feature_template.json metadata.category_code (often empty).
+    #   3. part_family text inference via _normalize_category.
+    if category_resolution is not None and category_resolution.matched:
+        category_code = category_resolution.category_code or ""
+        # Use the YAML name (more authoritative than the LLM-extracted part_family).
+        name = category_resolution.category_name or name
+        if category_resolution.description:
+            description = (description + " | " + category_resolution.description[:120]).strip(" |")
+    else:
+        # Try the YAML resolver if downloads_root is provided.
+        if downloads_root is not None and category_resolution is None:
+            try:
+                from scripts.similarity.category_resolver import (
+                    load_yaml_index,
+                    resolve_category,
+                )
+                idx = load_yaml_index(yaml_path=yaml_path)
+                res = resolve_category(idx, component_id, downloads_root=downloads_root)
+                if res.matched and res.category_code:
+                    category_code = res.category_code
+                    name = res.category_name or name
+                    if res.description:
+                        description = (description + " | " + res.description[:120]).strip(" |")
+            except (FileNotFoundError, ImportError):
+                pass
+
     text = " | ".join(
         filter(
             None,
@@ -345,12 +391,22 @@ def build_fingerprint(feature_template_path: Path, component_id: str) -> Compone
         )
     )
 
+    # When category_code is set from the YAML, ALSO compute category_root
+    # from the YAML's category_name (via PART_FAMILY_PREFIX_CATEGORIES) so
+    # multiple components in the same MISUMI category cluster together
+    # (e.g. all 3 Linear Shafts normalize to root='shaft'). If the YAML
+    # name doesn't match a prefix, fall back to the first-token-of-code rule.
+    if category_resolution is not None and category_resolution.matched and category_resolution.category_name:
+        category_root = _normalize_category("", part_family=category_resolution.category_name)
+    else:
+        category_root = _normalize_category(category_code, part_family=name)
+
     return ComponentFingerprint(
         component_id=component_id,
         name=name,
         description=description,
         category_code=category_code,
-        category_root=_normalize_category(category_code, part_family=name),
+        category_root=category_root,
         attribute_keys=attribute_keys,
         value_keys=value_keys,
         variant_count=variant_count,

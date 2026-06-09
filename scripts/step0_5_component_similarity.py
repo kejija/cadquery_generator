@@ -27,6 +27,7 @@ from pathlib import Path
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from scripts.similarity.category_resolver import load_yaml_index, resolve_category
 from scripts.similarity.cluster import PartFamily, cluster_fingerprints
 from scripts.similarity.filter import same_root_components, structural_candidates
 from scripts.similarity.fingerprint import build_fingerprint
@@ -37,6 +38,8 @@ DEFAULT_TEMPLATES_DIR = Path("output/feature_templates")
 DEFAULT_OUT_DIR = Path("output/families")
 DEFAULT_CHROMA_DIR = Path(".chroma/component_fingerprints")
 DEFAULT_STATE_DB = Path("output/workflow_state.sqlite3")
+DEFAULT_DOWNLOADS_DIR = Path("downloads")
+DEFAULT_YAML_PATH = Path("data/hierachy_enriched_final.yaml")
 DEFAULT_JACCARD = 0.5
 DEFAULT_TEMPLATE_JACCARD = 0.8
 
@@ -203,6 +206,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="Local Chroma persist directory.")
     p.add_argument("--state-db", type=Path, default=DEFAULT_STATE_DB,
                    help="workflow_state.sqlite3 path (will ALTER TABLE to add family_id).")
+    p.add_argument("--downloads-dir", type=Path, default=DEFAULT_DOWNLOADS_DIR,
+                   help="Downloads directory for category resolution via specs.json breadcrumbs.")
+    p.add_argument("--yaml-path", type=Path, default=DEFAULT_YAML_PATH,
+                   help="MISUMI category hierarchy YAML. If missing, falls back to part_family text inference.")
     p.add_argument("--jaccard", type=float, default=DEFAULT_JACCARD,
                    help="Structural pre-filter Jaccard threshold on value_keys (default 0.5).")
     p.add_argument("--template-jaccard", type=float, default=DEFAULT_TEMPLATE_JACCARD,
@@ -220,6 +227,8 @@ def main(argv: list[str] | None = None) -> int:
     out_dir: Path = args.out_dir
     chroma_dir: Path = args.chroma_dir
     state_db: Path = args.state_db
+    downloads_dir: Path = args.downloads_dir
+    yaml_path: Path = args.yaml_path
 
     out_dir.mkdir(parents=True, exist_ok=True)
     chroma_dir.mkdir(parents=True, exist_ok=True)
@@ -232,12 +241,38 @@ def main(argv: list[str] | None = None) -> int:
 
     print(f"[step0.5] Found {len(template_files)} feature template(s) in {templates_dir}")
 
+    # 1b. Load YAML category index (if available) and pre-resolve all categories.
+    yaml_index = None
+    if yaml_path and yaml_path.exists():
+        try:
+            yaml_index = load_yaml_index(yaml_path=yaml_path)
+            print(f"[step0.5] Loaded category hierarchy: {len(yaml_index)} nodes from {yaml_path}")
+        except Exception as e:
+            print(f"[step0.5] WARN: could not load YAML at {yaml_path}: {e}")
+            yaml_index = None
+    else:
+        print(f"[step0.5] No category YAML at {yaml_path}; falling back to part_family text inference.")
+
+    category_resolutions: dict[str, object] = {}
+    if yaml_index is not None:
+        for tf in template_files:
+            cid = tf.stem.split(".")[0]
+            res = resolve_category(yaml_index, cid, downloads_root=downloads_dir)
+            category_resolutions[cid] = res
+        matched = sum(1 for r in category_resolutions.values() if r.matched)
+        print(f"[step0.5] Resolved {matched}/{len(category_resolutions)} component categories from YAML")
+
     # 2. Build fingerprints.
     fps = []
     for tf in template_files:
         cid = tf.stem.split(".")[0]  # '110300324920.feature_template' -> '110300324920'
+        cat_res = category_resolutions.get(cid)
         try:
-            fp = build_fingerprint(tf, component_id=cid)
+            fp = build_fingerprint(
+                tf,
+                component_id=cid,
+                category_resolution=cat_res,
+            )
         except (FileNotFoundError, ValueError) as e:
             print(f"[step0.5] WARN: skipping {tf.name}: {e}")
             continue
