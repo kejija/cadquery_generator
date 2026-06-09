@@ -4,6 +4,7 @@ import base64
 import mimetypes
 import os
 from datetime import datetime
+from functools import lru_cache
 from pathlib import Path
 import sys
 import urllib.error
@@ -1091,6 +1092,53 @@ def discover_component_dirs(downloads_dir: str | Path, limit: int | None = None)
     return components
 
 
+# --- Task 12: read-only family + merged-tables hook (v1 debug log only) -----
+EMPTY_FAMILY_INDEX: dict = {"families": [], "family_count": 0}
+
+
+@lru_cache(maxsize=1)
+def load_family_index(families_dir: str | Path) -> dict:
+    """Read ``families_dir/index.json``; empty index if missing."""
+    path = Path(families_dir) / "index.json"
+    if not path.exists():
+        return dict(EMPTY_FAMILY_INDEX)
+    try:
+        with path.open(encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"[step1] could not read family index at {path}: {exc}", file=sys.stderr)
+        return dict(EMPTY_FAMILY_INDEX)
+
+
+def _family_for_component(component_id: str, family_index: dict) -> dict | None:
+    """Return the family dict containing ``component_id`` or ``None``."""
+    if not component_id or not family_index:
+        return None
+    for fam in family_index.get("families", []):
+        if component_id in (fam.get("members") or []):
+            return fam
+    return None
+
+
+def load_merged_tables(component_id: str, families_dir: str | Path) -> dict | None:
+    """Return merged-tables dict for ``component_id``'s family, or None.
+
+    ``None`` when no family or step 0.6 hasn't produced ``merged_tables.json``.
+    """
+    fam = _family_for_component(component_id, load_family_index(families_dir))
+    if not fam:
+        return None
+    path = Path(families_dir) / fam["family_id"] / "merged_tables.json"
+    if not path.exists():
+        return None
+    try:
+        with path.open(encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"[step1] could not read merged tables at {path}: {exc}", file=sys.stderr)
+        return None
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Step 1: drawing + datasheet JSON -> feature-template batch requests.")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -1110,6 +1158,7 @@ def parse_args() -> argparse.Namespace:
     batch.add_argument("--model", default=DEFAULT_MODEL)
     batch.add_argument("--state-db", type=Path)
     batch.add_argument("--status", default="done", choices=["all", "pending", "error", "done", "skipped"])
+    batch.add_argument("--families-dir", type=Path, default=Path("output/families"))
 
     validate = subparsers.add_parser("validate-batch-jsonl", help="Validate JSONL endpoint consistency before upload.")
     validate.add_argument("jsonl", type=Path)
@@ -1205,6 +1254,26 @@ def main() -> int:
             components = components[: args.limit]
     else:
         components = discover_component_dirs(args.downloads_dir, args.limit)
+
+    # Task 12 (read-only): log family context per component. v1 debug artifact
+    # for the v2 follow-up; does not change the body, prompt, or batch output.
+    _family_log_path = args.output_dir / "step1_family_context.log"
+    with _family_log_path.open("w", encoding="utf-8") as _logf:
+        for _cdir in components:
+            _cid = Path(_cdir).name
+            _fam = _family_for_component(_cid, load_family_index(args.families_dir))
+            _line = f"component={_cid}"
+            if _fam:
+                _line += f" family_id={_fam['family_id']} category_root={_fam.get('category_root')} n_members={_fam.get('n_members')}"
+                _mt = load_merged_tables(_cid, args.families_dir)
+                if _mt is not None:
+                    _line += f" merged_tables_sections={list(_mt.get('sections', {}).keys())}"
+                else:
+                    _line += " merged_tables=missing"
+            else:
+                _line += " family_id=none"
+            _logf.write(_line + "\n")
+            print(f"[step1] {_line}")
 
     output_path = create_batch_jsonl(
         component_dirs=components,

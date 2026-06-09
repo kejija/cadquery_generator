@@ -15,7 +15,7 @@ from pathlib import Path
 
 import pytest
 
-REPO = Path("/tmp/codex-task11")
+REPO = Path("/home/keji/fe/cadquery_generator")
 CLI = REPO / "scripts" / "step0_6_table_merge.py"
 PYTHON = REPO / ".venv-sim" / "bin" / "python"
 
