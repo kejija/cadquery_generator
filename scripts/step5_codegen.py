@@ -215,6 +215,23 @@ def _emitter_records_feature(code: Iterable[str]) -> bool:
     return any("feature_log.append(" in line or "not_implemented.append(" in line for line in code)
 
 
+def _numeric_param(feature: dict, candidates: Iterable[str]) -> tuple[Any, str | None, str | None]:
+    name = param_name(feature, *candidates)
+    value = param_value(feature, *candidates)
+    expr = snake(name) if name and isinstance(value, (int, float)) else None
+    return value, name, expr
+
+
+def _todo_feature(feature: dict, reason: str, detail: str | None = None) -> list[str]:
+    fid = feature.get("id", "?")
+    todo = reason if detail is None else f"{reason}: {detail}"
+    return [
+        f"# TODO: {todo}",
+        f"not_implemented.append({fid!r})",
+        f"# reason: {reason}",
+    ]
+
+
 def allow_symbolic_edge_break(feature: dict) -> bool:
     """Allow small placeholder chamfers/fillets on shaft specs with a usable axis."""
     bindings = feature.get("_parameter_bindings") or {}
@@ -291,36 +308,50 @@ def emit_custom_2d_profile_extrude(
     *,
     require_envelope_dims: bool = False,
 ) -> tuple[list[str], bool, str | None] | None:
-    has_width = param_name(feature, *CUSTOM_WIDTH_CANDIDATES) or (
-        None if require_envelope_dims else binding_name(feature, *CUSTOM_WIDTH_CANDIDATES)
-    )
-    has_height = param_name(feature, *CUSTOM_HEIGHT_CANDIDATES) or (
-        None if require_envelope_dims else binding_name(feature, *CUSTOM_HEIGHT_CANDIDATES)
-    )
-    if require_envelope_dims and not (has_width and has_height):
+    W, _, W_expr = _numeric_param(feature, CUSTOM_WIDTH_CANDIDATES)
+    H, _, H_expr = _numeric_param(feature, CUSTOM_HEIGHT_CANDIDATES)
+    T, _, T_expr = _numeric_param(feature, CUSTOM_THICKNESS_CANDIDATES)
+    L, _, L_expr = _numeric_param(feature, CUSTOM_LENGTH_CANDIDATES)
+    if not L_expr:
+        b_name = binding_name(feature, *CUSTOM_LENGTH_CANDIDATES)
+        if isinstance(binding_value(feature, b_name), (int, float)):
+            L = binding_value(feature, b_name)
+            L_expr = snake(b_name) if b_name else repr(L)
+    if require_envelope_dims and not (W_expr and H_expr):
         return None
 
-    W_expr = numeric_param_expr(feature, CUSTOM_WIDTH_CANDIDATES, 40.0)
-    H_expr = numeric_param_expr(feature, CUSTOM_HEIGHT_CANDIDATES, 120.0)
-    T_expr = numeric_param_expr(feature, CUSTOM_THICKNESS_CANDIDATES, 2.0)
-    L_expr = numeric_param_expr(feature, CUSTOM_LENGTH_CANDIDATES, 800.0)
+    if not (W_expr or H_expr) or not L_expr:
+        reason = "custom_2d_profile extrude requires numeric W or H and length"
+        detail = f"W={W!r}, H={H!r}, length={L!r}"
+        return _todo_feature(feature, reason, detail), False, reason
+
+    W_expr = W_expr or H_expr
+    H_expr = H_expr or W_expr
+    inner_lines = []
+    if T_expr:
+        inner_lines = [
+            f"    inner = cq.Workplane('YZ').rect(W - 2*T, H - 2*T)",
+            f"    void = inner.extrude(L)",
+            f"    result = envelope.cut(void)",
+        ]
+    else:
+        inner_lines = [
+            f"    result = envelope",
+        ]
+
     return [
         f"try:",
-        f"    W = {W_expr}      # default 40.0",
-        f"    H = {H_expr}     # default 120.0",
-        f"    T = {T_expr}   # default 2.0",
-        f"    L = {L_expr} # default 800.0",
+        f"    W = {W_expr}",
+        f"    H = {H_expr}",
+        *((f"    T = {T_expr}",) if T_expr else ()),
+        f"    L = {L_expr}",
         f"    outer = cq.Workplane('YZ').rect(W, H)",
-        f"    inner = cq.Workplane('YZ').rect(W - 2*T, H - 2*T)",
-        f"    # Note: we use cutToThickest / extrude both then subtract for a",
-        f"    # simple approximation.",
         f"    envelope = outer.extrude(L)",
-        f"    void = inner.extrude(L)",
-        f"    result = envelope.cut(void)",
+        *inner_lines,
         f"    feature_log.append({feature.get('id', '?')!r})",
         f"except Exception:",
         f"    not_implemented.append({feature.get('id', '?')!r})",
-        f"    # reason: custom_2d_profile unsupported: placeholder extrusion failed",
+        f"    # reason: custom_2d_profile extrusion failed",
     ], True, None
 
 def emit_base_body(feature: dict) -> tuple[list[str], bool, str | None]:
@@ -432,11 +463,32 @@ def emit_pocket(feature: dict) -> tuple[list[str], bool, str | None]:
     sub = feature.get("subtype") or ""
     fid = feature.get("id", "?")
     if prim == "cut_extrude":
-        W_expr = numeric_param_expr(feature, POCKET_WIDTH_CANDIDATES, 5.0)
-        L_expr = numeric_param_expr(feature, POCKET_LENGTH_CANDIDATES, 5.0)
-        pos_expr = numeric_position_x_expr(feature)
+        W, _, W_expr = _numeric_param(feature, POCKET_WIDTH_CANDIDATES)
+        L, _, L_expr = _numeric_param(feature, POCKET_LENGTH_CANDIDATES)
+        if not (W_expr and L_expr):
+            reason = "cut_extrude requires numeric width and length"
+            detail = f"width={W!r}, length={L!r}"
+            return _todo_feature(feature, reason, detail), False, reason
+
+        pos = (feature.get("position") or {}).get("x")
+        if not isinstance(pos, (int, float)):
+            reason = "cut_extrude requires numeric position"
+            detail = f"position={pos!r}"
+            return _todo_feature(feature, reason, detail), False, reason
+        pos_expr = repr(pos)
         depth = (feature.get("construction") or {}).get("depth")
-        depth_expr = repr(depth) if isinstance(depth, (int, float)) else overall_length_fallback_expr(feature)
+        if isinstance(depth, (int, float)):
+            depth_expr = repr(depth)
+        else:
+            depth_value, _, depth_expr = _numeric_param(feature, CUSTOM_LENGTH_CANDIDATES)
+            if not depth_expr:
+                b_name = binding_name(feature, "overall_length", "Overall length")
+                if isinstance(binding_value(feature, b_name), (int, float)):
+                    depth_expr = snake(b_name) if b_name else repr(binding_value(feature, b_name))
+            if not depth_expr:
+                reason = "cut_extrude requires numeric depth"
+                detail = f"depth={depth_value if depth_value is not None else depth!r}"
+                return _todo_feature(feature, reason, detail), False, reason
         return [
             f"try:",
             f"    pocket_wp = (",
@@ -449,16 +501,24 @@ def emit_pocket(feature: dict) -> tuple[list[str], bool, str | None]:
             f"    feature_log.append({fid!r})",
             f"except Exception:",
             f"    not_implemented.append({fid!r})",
-            f"    # reason: cut_extrude unsupported: placeholder cut failed",
+            f"    # reason: cut_extrude failed",
         ], True, None
 
     if prim == "cut_revolve":
-        D_expr = numeric_param_expr(feature, REVOLVE_DIAMETER_CANDIDATES, 5.0)
+        D, _, D_expr = _numeric_param(feature, REVOLVE_DIAMETER_CANDIDATES)
         pos = (feature.get("position") or {}).get("x")
         if isinstance(pos, (int, float)):
             pos_expr = repr(pos)
         else:
-            pos_expr = numeric_param_expr(feature, REVOLVE_POSITION_CANDIDATES, 0.0)
+            P, _, pos_expr = _numeric_param(feature, REVOLVE_POSITION_CANDIDATES)
+            if not pos_expr:
+                reason = "cut_revolve requires numeric diameter and length/position"
+                detail = f"diameter={D!r}, position={pos!r}, length={P!r}"
+                return _todo_feature(feature, reason, detail), False, reason
+        if not D_expr:
+            reason = "cut_revolve requires numeric diameter and length/position"
+            detail = f"diameter={D!r}, position={pos!r}"
+            return _todo_feature(feature, reason, detail), False, reason
         return [
             f"try:",
             f"    rev_wp = (",
@@ -471,7 +531,7 @@ def emit_pocket(feature: dict) -> tuple[list[str], bool, str | None]:
             f"    feature_log.append({fid!r})",
             f"except Exception:",
             f"    not_implemented.append({fid!r})",
-            f"    # reason: cut_revolve unsupported: placeholder cut failed",
+            f"    # reason: cut_revolve failed",
         ], True, None
 
     return [
@@ -516,28 +576,31 @@ def emit_chamfer(feature: dict) -> tuple[list[str], bool, str | None]:
     C_name = param_name(feature, "C", "chamfer", "Chamfer", "chamfer_size", "Corner chamfer size", "end_chamfer")
     C_var = snake(C_name) if C_name else "C_val"
     if prim == "cut_revolve":
-        if isinstance(C, (int, float)):
-            C_expr = C_var
-        else:
-            J = param_value(feature, "J", "taper_length", "T")
-            J_name = param_name(feature, "J", "taper_length", "T")
-            C_expr = snake(J_name) if isinstance(J, (int, float)) and J_name else "2.0"
-        length_expr = numeric_param_expr(feature, CUSTOM_LENGTH_CANDIDATES, 10.0)
-        od_expr = numeric_param_expr(
+        taper, _, taper_expr = _numeric_param(feature, CUSTOM_LENGTH_CANDIDATES)
+        if not (isinstance(C, (int, float)) and taper_expr):
+            reason = "chamfer cut_revolve requires numeric taper and C"
+            detail = f"taper={taper!r}, C={C!r}"
+            return _todo_feature(feature, reason, detail), False, reason
+
+        OD, _, od_expr = _numeric_param(
             feature,
             (
                 "body_outer_diameter", "Body outer diameter", "outer_diameter", "D",
                 "diameter", "shaft_diameter", "Shaft diameter", "OD",
             ),
-            5.0,
         )
+        if not od_expr:
+            reason = "chamfer cut_revolve requires numeric diameter"
+            detail = f"diameter={OD!r}"
+            return _todo_feature(feature, reason, detail), False, reason
+
         return [
             f"try:",
             f"    taper = (",
             f"        cq.Workplane('YZ')",
-            f"        .workplane(offset={length_expr} - {C_expr})",
+            f"        .workplane(offset={taper_expr} - {C_var})",
             f"        .circle({od_expr}/2)",
-            f"        .workplane(offset={C_expr})",
+            f"        .workplane(offset={C_var})",
             f"        .circle({od_expr}/2 * 0.5)",
             f"        .loft(combine=True)",
             f"    )",
@@ -556,13 +619,6 @@ def emit_chamfer(feature: dict) -> tuple[list[str], bool, str | None]:
             f"except Exception:",
             f"    pass  # no suitable edges for chamfer",
         ], True, None
-    if allow_symbolic_edge_break(feature):
-        return [
-            f"try:",
-            f"    result = result.edges('|Z').chamfer(1.0)",
-            f"except Exception:",
-            f"    pass  # no suitable edges for chamfer",
-        ], True, None
     return [f"# TODO: chamfer skipped (C={C!r} not numeric)"], False, f"chamfer C={C!r}"
 
 
@@ -576,13 +632,6 @@ def emit_fillet(feature: dict) -> tuple[list[str], bool, str | None]:
         return [
             f"try:",
             f"    result = result.edges('|Z').fillet({R_var})",
-            f"except Exception:",
-            f"    pass  # no suitable edges for fillet",
-        ], True, None
-    if allow_symbolic_edge_break(feature):
-        return [
-            f"try:",
-            f"    result = result.edges('|Z').fillet(1.0)",
             f"except Exception:",
             f"    pass  # no suitable edges for fillet",
         ], True, None
