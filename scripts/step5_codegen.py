@@ -145,15 +145,97 @@ def diameter_from(feature: dict) -> Any:
         "body_outer_diameter", "Body outer diameter", "outer_diameter", "D",
         "diameter", "shaft_diameter", "Shaft diameter", "OD", "across_flats",
         "hex_width_across_flats", "Hex width across flats",
+        "internal_bore_diameter", "hole_diameter", "Hole diameter",
+        "Through hole diameter", "clearance_hole_diameter", "cross_drilled_hole_diameter",
     )
 
 
 def radius_from(feature: dict) -> Any:
-    v = param_value(feature, "R", "radius", "Radius", "fillet_radius", "Fillet radius")
+    v = param_value(feature, "R", "radius", "Radius", "fillet_radius", "Fillet radius", "shoulder_fillet_radius")
     if v is None:
         # chamfer/fillet with no R is allowed; chamfers usually have C
-        v = param_value(feature, "C", "chamfer", "Chamfer")
+        v = param_value(feature, "C", "chamfer", "Chamfer", "Corner chamfer size", "end_chamfer")
     return v
+
+
+def _norm_param_name(name: str) -> str:
+    return name.lower().replace(" ", "").replace("-", "").replace("_", "")
+
+
+def binding_name(feature: dict, *candidates: str) -> str | None:
+    """Return a matching parameter_binding name carried on the feature copy."""
+    wanted = {_norm_param_name(c) for c in candidates}
+    for name in (feature.get("_parameter_bindings") or {}):
+        if _norm_param_name(name) in wanted:
+            return name
+    return None
+
+
+def binding_value(feature: dict, name: str | None) -> Any:
+    if not name:
+        return None
+    return (feature.get("_parameter_bindings") or {}).get(name)
+
+
+def numeric_param_expr(feature: dict, candidates: Iterable[str], default: float) -> str:
+    """Return a generated-code expression for a numeric feature parameter.
+
+    Symbolic parameter values are intentionally not resolved here; the
+    deterministic path falls back to the supplied numeric placeholder.
+    """
+    name = param_name(feature, *candidates)
+    value = param_value(feature, *candidates)
+    if isinstance(value, (int, float)):
+        return snake(name) if name else repr(value)
+    b_name = binding_name(feature, *candidates)
+    if isinstance(binding_value(feature, b_name), (int, float)):
+        return snake(b_name) if b_name else repr(default)
+    return repr(default)
+
+
+def numeric_position_x_expr(feature: dict) -> str:
+    pos = (feature.get("position") or {}).get("x")
+    if isinstance(pos, (int, float)):
+        return repr(pos)
+    return "0"
+
+
+def overall_length_fallback_expr(feature: dict, default: float = 10.0) -> str:
+    name = binding_name(feature, "overall_length", "Overall length")
+    return snake(name) if name else repr(default)
+
+
+def _feature_with_bindings(feature: dict, params: dict[str, Any]) -> dict:
+    f = dict(feature)
+    f["_parameter_bindings"] = params
+    return f
+
+
+def _emitter_records_feature(code: Iterable[str]) -> bool:
+    return any("feature_log.append(" in line or "not_implemented.append(" in line for line in code)
+
+
+def _numeric_param(feature: dict, candidates: Iterable[str]) -> tuple[Any, str | None, str | None]:
+    name = param_name(feature, *candidates)
+    value = param_value(feature, *candidates)
+    expr = snake(name) if name and isinstance(value, (int, float)) else None
+    return value, name, expr
+
+
+def _todo_feature(feature: dict, reason: str, detail: str | None = None) -> list[str]:
+    fid = feature.get("id", "?")
+    todo = reason if detail is None else f"{reason}: {detail}"
+    return [
+        f"# TODO: {todo}",
+        f"not_implemented.append({fid!r})",
+        f"# reason: {reason}",
+    ]
+
+
+def allow_symbolic_edge_break(feature: dict) -> bool:
+    """Allow small placeholder chamfers/fillets on shaft specs with a usable axis."""
+    bindings = feature.get("_parameter_bindings") or {}
+    return "L" in bindings or "shaft_diameter" in bindings
 
 
 def is_metadata_feature(feature: dict) -> bool:
@@ -183,6 +265,95 @@ def part_number_of(spec_path: Path) -> str:
 # applied=False means the feature was acknowledged but not modeled; the
 # caller records it on the not_implemented list.
 
+POCKET_WIDTH_CANDIDATES = (
+    "W", "width", "Width", "slot_width", "wrench_flat_width",
+    "ℓ1", "l1", "L1",
+)
+POCKET_LENGTH_CANDIDATES = (
+    "ℓ1", "L1", "l1", "length", "Length", "slot_length", "wrench_flat_length",
+)
+POCKET_POSITION_CANDIDATES = (
+    "SC", "sc", "position_x", "x_pos", "pos_x", "start_position",
+    "Offset", "offset", "wrench_flat_offset",
+)
+REVOLVE_DIAMETER_CANDIDATES = (
+    "D", "diameter", "bore_diameter", "internal_bore_diameter",
+    "reduced_section_diameter", "P", "M",
+)
+REVOLVE_POSITION_CANDIDATES = (
+    "L", "length", "reduced_section_length", "F", "F25", "SC",
+)
+CUSTOM_WIDTH_CANDIDATES = (
+    "Overall width", "overall_width", "Body outer diameter",
+    "body_outer_diameter", "D", "width",
+)
+CUSTOM_HEIGHT_CANDIDATES = (
+    "Overall height", "overall_height", "body_outer_diameter", "D1", "height",
+)
+CUSTOM_THICKNESS_CANDIDATES = (
+    "Wall/web thickness", "Wall web thickness", "t", "wall_thickness",
+    "Thickness",
+)
+CUSTOM_LENGTH_CANDIDATES = (
+    "Overall length", "overall_length", "L", "length", "tightening_section_length",
+)
+RECT_WIDTH_CANDIDATES = ("Overall width", "overall_width", "width", "W")
+RECT_HEIGHT_CANDIDATES = ("Overall height", "overall_height", "height", "H")
+RECT_THICKNESS_CANDIDATES = ("Thickness", "T", "thickness", "depth")
+
+
+def emit_custom_2d_profile_extrude(
+    feature: dict,
+    ftype: str,
+    *,
+    require_envelope_dims: bool = False,
+) -> tuple[list[str], bool, str | None] | None:
+    W, _, W_expr = _numeric_param(feature, CUSTOM_WIDTH_CANDIDATES)
+    H, _, H_expr = _numeric_param(feature, CUSTOM_HEIGHT_CANDIDATES)
+    T, _, T_expr = _numeric_param(feature, CUSTOM_THICKNESS_CANDIDATES)
+    L, _, L_expr = _numeric_param(feature, CUSTOM_LENGTH_CANDIDATES)
+    if not L_expr:
+        b_name = binding_name(feature, *CUSTOM_LENGTH_CANDIDATES)
+        if isinstance(binding_value(feature, b_name), (int, float)):
+            L = binding_value(feature, b_name)
+            L_expr = snake(b_name) if b_name else repr(L)
+    if require_envelope_dims and not (W_expr and H_expr):
+        return None
+
+    if not (W_expr or H_expr) or not L_expr:
+        reason = "custom_2d_profile extrude requires numeric W or H and length"
+        detail = f"W={W!r}, H={H!r}, length={L!r}"
+        return _todo_feature(feature, reason, detail), False, reason
+
+    W_expr = W_expr or H_expr
+    H_expr = H_expr or W_expr
+    inner_lines = []
+    if T_expr:
+        inner_lines = [
+            f"    inner = cq.Workplane('YZ').rect(W - 2*T, H - 2*T)",
+            f"    void = inner.extrude(L)",
+            f"    result = envelope.cut(void)",
+        ]
+    else:
+        inner_lines = [
+            f"    result = envelope",
+        ]
+
+    return [
+        f"try:",
+        f"    W = {W_expr}",
+        f"    H = {H_expr}",
+        *((f"    T = {T_expr}",) if T_expr else ()),
+        f"    L = {L_expr}",
+        f"    outer = cq.Workplane('YZ').rect(W, H)",
+        f"    envelope = outer.extrude(L)",
+        *inner_lines,
+        f"    feature_log.append({feature.get('id', '?')!r})",
+        f"except Exception:",
+        f"    not_implemented.append({feature.get('id', '?')!r})",
+        f"    # reason: custom_2d_profile extrusion failed",
+    ], True, None
+
 def emit_base_body(feature: dict) -> tuple[list[str], bool, str | None]:
     prim = feature.get("modeling_primitive")
     profile = (feature.get("construction") or {}).get("profile_type", "")
@@ -194,6 +365,28 @@ def emit_base_body(feature: dict) -> tuple[list[str], bool, str | None]:
     D_name = param_name(feature, "body_outer_diameter", "Body outer diameter", "outer_diameter", "D", "diameter", "shaft_diameter", "Shaft diameter", "OD", "across_flats", "hex_width_across_flats", "Hex width across flats")
     L_var = snake(L_name) if L_name else "L_val"
     D_var = snake(D_name) if D_name else "D_val"
+
+    if prim == "extrude" and profile == "custom_2d_profile":
+        custom = emit_custom_2d_profile_extrude(feature, "base_body")
+        if custom:
+            return custom
+
+    if prim == "extrude" and profile == "rectangle":
+        W = param_value(feature, *RECT_WIDTH_CANDIDATES)
+        H = param_value(feature, *RECT_HEIGHT_CANDIDATES)
+        T = param_value(feature, *RECT_THICKNESS_CANDIDATES)
+        if isinstance(W, (int, float)) and isinstance(H, (int, float)) and isinstance(T, (int, float)):
+            W_var = snake(param_name(feature, *RECT_WIDTH_CANDIDATES) or "W")
+            H_var = snake(param_name(feature, *RECT_HEIGHT_CANDIDATES) or "H")
+            T_var = snake(param_name(feature, *RECT_THICKNESS_CANDIDATES) or "T")
+            return [
+                f"try:",
+                f"    result = cq.Workplane('XY').rect({W_var}, {H_var}).extrude({T_var})",
+                f"    feature_log.append({feature.get('id', '?')!r})",
+                f"except Exception:",
+                f"    not_implemented.append({feature.get('id', '?')!r})",
+                f"    # reason: rectangle extrude failed",
+            ], True, None
 
     if prim == "extrude" and profile == "circle" and isinstance(D, (int, float)) and isinstance(L, (int, float)):
         if axis == "X":
@@ -246,6 +439,10 @@ def emit_boss(feature: dict) -> tuple[list[str], bool, str | None]:
     D_name = param_name(feature, "body_outer_diameter", "Body outer diameter", "outer_diameter", "D", "diameter", "shaft_diameter", "Shaft diameter", "OD", "across_flats", "hex_width_across_flats", "Hex width across flats")
     L_var = snake(L_name) if L_name else "L_val"
     D_var = snake(D_name) if D_name else "D_val"
+    if prim == "extrude" and profile == "custom_2d_profile":
+        custom = emit_custom_2d_profile_extrude(feature, "boss", require_envelope_dims=True)
+        if custom:
+            return custom
     if prim == "extrude" and "polygon" in profile.lower() and isinstance(D, (int, float)) and isinstance(L, (int, float)):
         return [
             f"boss = cq.Workplane('XY').polygon(6, {D_var}).extrude({L_var})",
@@ -261,18 +458,111 @@ def emit_boss(feature: dict) -> tuple[list[str], bool, str | None]:
     ], False, f"boss unsupported: prim={prim}, profile={profile}"
 
 
+def emit_pocket(feature: dict) -> tuple[list[str], bool, str | None]:
+    prim = feature.get("modeling_primitive")
+    sub = feature.get("subtype") or ""
+    fid = feature.get("id", "?")
+    if prim == "cut_extrude":
+        W, _, W_expr = _numeric_param(feature, POCKET_WIDTH_CANDIDATES)
+        L, _, L_expr = _numeric_param(feature, POCKET_LENGTH_CANDIDATES)
+        if not (W_expr and L_expr):
+            reason = "cut_extrude requires numeric width and length"
+            detail = f"width={W!r}, length={L!r}"
+            return _todo_feature(feature, reason, detail), False, reason
+
+        pos = (feature.get("position") or {}).get("x")
+        if not isinstance(pos, (int, float)):
+            reason = "cut_extrude requires numeric position"
+            detail = f"position={pos!r}"
+            return _todo_feature(feature, reason, detail), False, reason
+        pos_expr = repr(pos)
+        depth = (feature.get("construction") or {}).get("depth")
+        if isinstance(depth, (int, float)):
+            depth_expr = repr(depth)
+        else:
+            depth_value, _, depth_expr = _numeric_param(feature, CUSTOM_LENGTH_CANDIDATES)
+            if not depth_expr:
+                b_name = binding_name(feature, "overall_length", "Overall length")
+                if isinstance(binding_value(feature, b_name), (int, float)):
+                    depth_expr = snake(b_name) if b_name else repr(binding_value(feature, b_name))
+            if not depth_expr:
+                reason = "cut_extrude requires numeric depth"
+                detail = f"depth={depth_value if depth_value is not None else depth!r}"
+                return _todo_feature(feature, reason, detail), False, reason
+        return [
+            f"try:",
+            f"    pocket_wp = (",
+            f"        cq.Workplane('YZ')",
+            f"        .workplane(offset={pos_expr}, centerOption='CenterOfMass')",
+            f"        .rect({W_expr}, {L_expr})",
+            f"        .extrude({depth_expr})",
+            f"    )",
+            f"    result = result.cut(pocket_wp)",
+            f"    feature_log.append({fid!r})",
+            f"except Exception:",
+            f"    not_implemented.append({fid!r})",
+            f"    # reason: cut_extrude failed",
+        ], True, None
+
+    if prim == "cut_revolve":
+        D, _, D_expr = _numeric_param(feature, REVOLVE_DIAMETER_CANDIDATES)
+        pos = (feature.get("position") or {}).get("x")
+        if isinstance(pos, (int, float)):
+            pos_expr = repr(pos)
+        else:
+            P, _, pos_expr = _numeric_param(feature, REVOLVE_POSITION_CANDIDATES)
+            if not pos_expr:
+                reason = "cut_revolve requires numeric diameter and length/position"
+                detail = f"diameter={D!r}, position={pos!r}, length={P!r}"
+                return _todo_feature(feature, reason, detail), False, reason
+        if not D_expr:
+            reason = "cut_revolve requires numeric diameter and length/position"
+            detail = f"diameter={D!r}, position={pos!r}"
+            return _todo_feature(feature, reason, detail), False, reason
+        return [
+            f"try:",
+            f"    rev_wp = (",
+            f"        cq.Workplane('YZ')",
+            f"        .workplane(offset={pos_expr})",
+            f"        .circle({D_expr}/2)",
+            f"        .revolve(360, (0, 0, 0), (1, 0, 0))",
+            f"    )",
+            f"    result = result.cut(rev_wp)",
+            f"    feature_log.append({fid!r})",
+            f"except Exception:",
+            f"    not_implemented.append({fid!r})",
+            f"    # reason: cut_revolve failed",
+        ], True, None
+
+    return [
+        f"# TODO: pocket not implemented (prim={prim!r}, subtype={sub!r})",
+    ], False, f"pocket unsupported: prim={prim}"
+
+
 def emit_hole(feature: dict) -> tuple[list[str], bool, str | None]:
     prim = feature.get("modeling_primitive")
     D = diameter_from(feature)
-    D_name = param_name(feature, "body_outer_diameter", "Body outer diameter", "outer_diameter", "D", "diameter", "shaft_diameter", "Shaft diameter", "OD", "across_flats", "hex_width_across_flats", "Hex width across flats", "internal_bore_diameter", "hole_diameter", "Hole diameter")
+    D_name = param_name(
+        feature,
+        "body_outer_diameter", "Body outer diameter", "outer_diameter", "D",
+        "diameter", "shaft_diameter", "Shaft diameter", "OD", "across_flats",
+        "hex_width_across_flats", "Hex width across flats", "internal_bore_diameter",
+        "hole_diameter", "Hole diameter", "Through hole diameter",
+        "clearance_hole_diameter", "cross_drilled_hole_diameter",
+    )
     D_var = snake(D_name) if D_name else "D_val"
     if prim in ("hole", "counterbore_hole") and isinstance(D, (int, float)):
         return [
-            f"result = (",
-            f"    result",
-            f"    .faces('>X').workplane(centerOption='CenterOfMass')",
-            f"    .hole({D_var})",
-            f")",
+            f"try:",
+            f"    result = (",
+            f"        result",
+            f"        .faces('>X').workplane(centerOption='CenterOfMass')",
+            f"        .hole({D_var})",
+            f"    )",
+            f"    feature_log.append({feature.get('id', '?')!r})",
+            f"except Exception:",
+            f"    not_implemented.append({feature.get('id', '?')!r})",
+            f"    # reason: hole failed",
         ], True, None
     return [
         f"# TODO: hole not implemented (prim={prim!r}, D={D!r})",
@@ -280,9 +570,46 @@ def emit_hole(feature: dict) -> tuple[list[str], bool, str | None]:
 
 
 def emit_chamfer(feature: dict) -> tuple[list[str], bool, str | None]:
-    C = param_value(feature, "C", "chamfer", "Chamfer", "chamfer_size")
-    C_name = param_name(feature, "C", "chamfer", "Chamfer", "chamfer_size")
+    prim = feature.get("modeling_primitive")
+    fid = feature.get("id", "?")
+    C = param_value(feature, "C", "chamfer", "Chamfer", "chamfer_size", "Corner chamfer size", "end_chamfer")
+    C_name = param_name(feature, "C", "chamfer", "Chamfer", "chamfer_size", "Corner chamfer size", "end_chamfer")
     C_var = snake(C_name) if C_name else "C_val"
+    if prim == "cut_revolve":
+        taper, _, taper_expr = _numeric_param(feature, CUSTOM_LENGTH_CANDIDATES)
+        if not (isinstance(C, (int, float)) and taper_expr):
+            reason = "chamfer cut_revolve requires numeric taper and C"
+            detail = f"taper={taper!r}, C={C!r}"
+            return _todo_feature(feature, reason, detail), False, reason
+
+        OD, _, od_expr = _numeric_param(
+            feature,
+            (
+                "body_outer_diameter", "Body outer diameter", "outer_diameter", "D",
+                "diameter", "shaft_diameter", "Shaft diameter", "OD",
+            ),
+        )
+        if not od_expr:
+            reason = "chamfer cut_revolve requires numeric diameter"
+            detail = f"diameter={OD!r}"
+            return _todo_feature(feature, reason, detail), False, reason
+
+        return [
+            f"try:",
+            f"    taper = (",
+            f"        cq.Workplane('YZ')",
+            f"        .workplane(offset={taper_expr} - {C_var})",
+            f"        .circle({od_expr}/2)",
+            f"        .workplane(offset={C_var})",
+            f"        .circle({od_expr}/2 * 0.5)",
+            f"        .loft(combine=True)",
+            f"    )",
+            f"    result = result.cut(taper)",
+            f"    feature_log.append({fid!r})",
+            f"except Exception:",
+            f"    not_implemented.append({fid!r})",
+            f"    # reason: chamfer cut_revolve taper failed",
+        ], True, None
     if C is None:
         return [f"# TODO: chamfer skipped (no C dimension)"], False, "chamfer no-dim"
     if isinstance(C, (int, float)):
@@ -296,8 +623,8 @@ def emit_chamfer(feature: dict) -> tuple[list[str], bool, str | None]:
 
 
 def emit_fillet(feature: dict) -> tuple[list[str], bool, str | None]:
-    R = param_value(feature, "R", "radius", "Radius", "fillet_radius", "Fillet radius")
-    R_name = param_name(feature, "R", "radius", "Radius", "fillet_radius", "Fillet radius")
+    R = param_value(feature, "R", "radius", "Radius", "fillet_radius", "Fillet radius", "shoulder_fillet_radius")
+    R_name = param_name(feature, "R", "radius", "Radius", "fillet_radius", "Fillet radius", "shoulder_fillet_radius")
     R_var = snake(R_name) if R_name else "R_val"
     if R is None:
         return [f"# TODO: fillet skipped (no R dimension)"], False, "fillet no-dim"
@@ -333,7 +660,7 @@ EMITTERS = {
     ("hole",): emit_hole,
     ("chamfer",): emit_chamfer,
     ("fillet",): emit_fillet,
-    ("pocket",): emit_unsupported,
+    ("pocket",): emit_pocket,
     ("cut",): emit_unsupported,
     ("pattern",): emit_unsupported,
     ("metadata",): emit_metadata,
@@ -351,11 +678,15 @@ def generate_model_py(spec: dict, spec_path: Path) -> tuple[str, int]:
     component_id = spec.get("catalog_id", "unknown")
     params = spec.get("parameter_bindings", {})
     features = spec.get("resolved_features", [])
+    try:
+        source_path = spec_path.relative_to(REPO_ROOT)
+    except ValueError:
+        source_path = spec_path
 
     out: list[str] = []
     out.append('"""')
     out.append(f"Auto-generated CadQuery model for part number {pn}.")
-    out.append(f"Source: {spec_path.relative_to(REPO_ROOT) if spec_path.is_absolute() else spec_path}")
+    out.append(f"Source: {source_path}")
     out.append(f"Template: {spec.get('template_id', '?')}")
     out.append("Generator: scripts/step5_codegen.py (deterministic)")
     out.append('"""')
@@ -415,14 +746,15 @@ def generate_model_py(spec: dict, spec_path: Path) -> tuple[str, int]:
         sub = feature.get("subtype") or ""
         out.append(f"# Feature: {fid} — {ftype} ({sub}) [prim={prim}]")
         emitter = EMITTERS.get((ftype,)) or emit_unsupported
-        code, applied, reason = emitter(feature)
+        code, applied, reason = emitter(_feature_with_bindings(feature, params))
         out.extend(code)
-        if applied:
-            out.append(f"feature_log.append({fid!r})")
-        else:
-            out.append(f"not_implemented.append({fid!r})")
-        if reason:
-            out.append(f"# reason: {reason}")
+        if not _emitter_records_feature(code):
+            if applied:
+                out.append(f"feature_log.append({fid!r})")
+            else:
+                out.append(f"not_implemented.append({fid!r})")
+            if reason:
+                out.append(f"# reason: {reason}")
         out.append("")
 
     out.append("# ----------------------------------------------------------------------------")
@@ -507,7 +839,7 @@ def process_spec(
     for f in spec.get("resolved_features", []):
         ftype = (f.get("feature_type") or "").lower()
         emitter = EMITTERS.get((ftype,)) or emit_unsupported
-        _, applied, reason = emitter(f)
+        _, applied, reason = emitter(_feature_with_bindings(f, spec.get("parameter_bindings", {})))
         if applied:
             res.features_implemented.append(f.get("id", "?"))
         else:

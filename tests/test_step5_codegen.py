@@ -164,3 +164,69 @@ def test_not_implemented_honest_for_unsupported_features():
         f"expected many not_implemented entries for the linear shaft, "
         f"got {v['not_implemented']}"
     )
+
+
+def test_pocket_cut_extrude_emits_geometry_with_numeric_dimensions():
+    """Pocket cut_extrude should emit a guarded CadQuery cut when dimensions are numeric."""
+    spec = {
+        "part_number": "POCKET_TEST",
+        "catalog_id": "0",
+        "template_id": "unit_test",
+        "parameter_bindings": {"W": 6, "L1": 12, "overall_length": 50},
+        "resolved_features": [
+            {
+                "id": "f_slot",
+                "feature_type": "pocket",
+                "subtype": "side_slot",
+                "modeling_primitive": "cut_extrude",
+                "parameters": [
+                    {"name": "W", "value": 6},
+                    {"name": "L1", "value": 12},
+                ],
+                "construction": {
+                    "profile_type": "rectangle",
+                    "depth": "SC + SX + L1",
+                },
+                "position": {"x": 0, "y": 0, "z": 0},
+            }
+        ],
+    }
+    feature = step5_codegen._feature_with_bindings(
+        spec["resolved_features"][0], spec["parameter_bindings"]
+    )
+    lines, applied, reason = step5_codegen.emit_pocket(feature)
+    code = "\n".join(lines)
+
+    assert applied is True
+    assert reason is None
+    assert "pocket_wp = (" in code
+    assert ".rect(w, l1)" in code
+    assert ".extrude(overall_length)" in code
+    assert "feature_log.append('f_slot')" in code
+
+
+def test_pocket_cut_extrude_skips_symbolic_width():
+    """Pocket cut_extrude should not emit fake geometry for unresolved width symbols."""
+    feature = {
+        "id": "f_slot",
+        "feature_type": "pocket",
+        "subtype": "side_slot",
+        "modeling_primitive": "cut_extrude",
+        "parameters": [
+            {"name": "W", "value": "F25"},
+            {"name": "L1", "value": 12},
+        ],
+        "construction": {
+            "profile_type": "rectangle",
+            "depth": 8,
+        },
+        "position": {"x": 0, "y": 0, "z": 0},
+    }
+
+    lines, applied, reason = step5_codegen.emit_pocket(feature)
+    code = "\n".join(lines)
+
+    assert applied is False
+    assert reason == "cut_extrude requires numeric width and length"
+    assert "not_implemented.append('f_slot')" in code
+    assert "# TODO" in code
